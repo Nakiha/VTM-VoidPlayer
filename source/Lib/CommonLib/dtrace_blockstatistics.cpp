@@ -41,6 +41,7 @@
 #include "CommonLib/Unit.h"
 #include "CommonLib/Picture.h"
 #include "CommonLib/UnitTools.h"
+#include "CommonLib/Slice.h"
 //#include "CommonLib/CodingStructure.h"
 #include <queue>
 #include <cstdlib>
@@ -78,15 +79,15 @@ static const char* binaryStatsPath()
 static bool isBinaryStatsMode() { return binaryStatsPath() != nullptr; }
 
 // ===========================================================================
-// VBS1 Binary Stats Format
+// VBS2 Binary Stats Format
 // ===========================================================================
 //
 // File layout:
-//   [Vbs1Header  16 bytes]
-//   [Frame 0: Vbs1FrameHeader(8B) + CU records ...]
+//   [Vbs2Header  16 bytes]
+//   [Frame 0: Vbs2FrameHeader(134B) + CU records ...]
 //   [Frame 1: ...]
 //   ...
-//   [Frame Index: Vbs1IndexEntry(8B) × num_frames]
+//   [Frame Index: Vbs2IndexEntry(8B) × num_frames]
 //
 // CU record (variable length):
 //   Common (9B):  x(2) y(2) w(1) h(1) depth(1) qp(1) pred_mode(1)
@@ -94,18 +95,27 @@ static bool isBinaryStatsMode() { return binaryStatsPath() != nullptr; }
 //   If inter (+13B): skip(1) merge(1) inter_dir(1) mvL0(4) mvL1(4) refL0(1) refL1(1)
 
 #pragma pack(push, 1)
-struct Vbs1Header {
-  char     magic[4];       // "VBS1"
+struct Vbs2Header {
+  char     magic[4];       // "VBS2"
   uint16_t width;
   uint16_t height;
   uint32_t num_frames;     // filled at finalize
   uint32_t index_offset;   // filled at finalize
 };
-struct Vbs1FrameHeader {
-  int32_t  poc;
-  int32_t  num_cus;        // filled when frame completes
+struct Vbs2FrameHeader {
+  int32_t  poc;            // -1 = sentinel
+  int32_t  num_cus;        // patched at endFrame
+  uint8_t  temporal_id;    // TId from slice
+  uint8_t  slice_type;     // 0=B, 1=P, 2=I (SliceType enum)
+  uint8_t  nal_unit_type;  // NalUnitType enum value
+  uint8_t  avg_qp;         // patched at endFrame
+  uint8_t  num_ref_l0;     // active ref count (0-15)
+  uint8_t  num_ref_l1;
+  int32_t  ref_pocs_l0[15]; // -1 = unused slot
+  int32_t  ref_pocs_l1[15];
 };
-struct Vbs1CuCommon {
+static_assert(sizeof(Vbs2FrameHeader) == 134, "Vbs2FrameHeader must be 134 bytes");
+struct Vbs2CuCommon {
   uint16_t x;
   uint16_t y;
   uint8_t  w;
@@ -114,12 +124,12 @@ struct Vbs1CuCommon {
   uint8_t  qp;
   uint8_t  pred_mode;      // 0=inter 1=intra 2=ibc 3=plt
 };
-struct Vbs1CuIntra {
+struct Vbs2CuIntra {
   uint8_t  intra_mode;
   uint8_t  mip_flag;
   uint8_t  isp_mode;
 };
-struct Vbs1CuInter {
+struct Vbs2CuInter {
   uint8_t  skip;
   uint8_t  merge_flag;
   uint8_t  inter_dir;
@@ -130,8 +140,8 @@ struct Vbs1CuInter {
   int8_t   ref_l0;
   int8_t   ref_l1;
 };
-struct Vbs1IndexEntry {
-  uint32_t offset;         // file offset of Vbs1FrameHeader
+struct Vbs2IndexEntry {
+  uint32_t offset;         // file offset of Vbs2FrameHeader
   uint32_t num_cus;
 };
 #pragma pack(pop)
@@ -141,20 +151,21 @@ struct BinaryStatsState {
   int     currentPoc = -1;
   long    frameHeaderPos = 0;
   uint32_t frameCuCount = 0;
+  uint32_t qpSum = 0;
   uint32_t numFrames = 0;
   uint16_t seqWidth = 0;
   uint16_t seqHeight = 0;
-  std::vector<Vbs1IndexEntry> index;
+  std::vector<Vbs2IndexEntry> index;
 
   bool open() {
     if (file) return true;
     const char* path = binaryStatsPath();
     if (!path) return false;
-    file = fopen(path, "wb");
+    file = fopen(path, "w+b");
     if (!file) { fprintf(stderr, "VTM_BINARY_STATS: cannot open %s\n", path); return false; }
     // write placeholder header (filled at finalize)
-    Vbs1Header hdr = {};
-    hdr.magic[0]='V'; hdr.magic[1]='B'; hdr.magic[2]='S'; hdr.magic[3]='1';
+    Vbs2Header hdr = {};
+    hdr.magic[0]='V'; hdr.magic[1]='B'; hdr.magic[2]='S'; hdr.magic[3]='2';
     hdr.width = 0; hdr.height = 0;
     hdr.num_frames = 0; hdr.index_offset = 0;
     fwrite(&hdr, sizeof(hdr), 1, file);
@@ -165,23 +176,53 @@ struct BinaryStatsState {
     seqWidth = w; seqHeight = h;
   }
 
-  void beginFrame(int poc) {
+  void beginFrame(int poc, const Slice* slice) {
     if (!file) return;
     if (currentPoc == poc) return;  // same frame, different CTU
     if (currentPoc >= 0) endFrame();
     currentPoc = poc;
     frameCuCount = 0;
+    qpSum = 0;
+
+    // Build extended frame header
+    Vbs2FrameHeader fh = {};
+    fh.poc = poc;
+    fh.num_cus = 0;
+    fh.temporal_id = slice ? slice->getTLayer() : 0;
+    fh.slice_type = slice ? slice->getSliceType() : 0;
+    fh.nal_unit_type = slice ? slice->getNalUnitType() : 0;
+    fh.avg_qp = 0;
+
+    if (slice) {
+      int nL0 = slice->getNumRefIdx(REF_PIC_LIST_0);
+      int nL1 = slice->getNumRefIdx(REF_PIC_LIST_1);
+      fh.num_ref_l0 = (uint8_t)std::min(nL0, 15);
+      fh.num_ref_l1 = (uint8_t)std::min(nL1, 15);
+      for (int i = 0; i < 15; i++) {
+        fh.ref_pocs_l0[i] = (i < nL0) ? slice->getRefPOC(REF_PIC_LIST_0, i) : -1;
+        fh.ref_pocs_l1[i] = (i < nL1) ? slice->getRefPOC(REF_PIC_LIST_1, i) : -1;
+      }
+    } else {
+      for (int i = 0; i < 15; i++) {
+        fh.ref_pocs_l0[i] = -1;
+        fh.ref_pocs_l1[i] = -1;
+      }
+    }
+
     frameHeaderPos = ftell(file);
-    Vbs1FrameHeader fh = { poc, 0 };
     fwrite(&fh, sizeof(fh), 1, file);
   }
 
   void endFrame() {
     if (!file || currentPoc < 0) return;
-    // patch frame header with actual CU count
+    // read back frame header, patch num_cus and avg_qp
     long saved = ftell(file);
     fseek(file, frameHeaderPos, SEEK_SET);
-    Vbs1FrameHeader fh = { currentPoc, (int32_t)frameCuCount };
+    Vbs2FrameHeader fh;
+    fread(&fh, sizeof(fh), 1, file);
+    fh.num_cus = (int32_t)frameCuCount;
+    fh.avg_qp = frameCuCount > 0 ? (uint8_t)(qpSum / frameCuCount) : 0;
+    fseek(file, frameHeaderPos, SEEK_SET);
     fwrite(&fh, sizeof(fh), 1, file);
     fseek(file, saved, SEEK_SET);
     index.push_back({ (uint32_t)frameHeaderPos, frameCuCount });
@@ -197,8 +238,8 @@ struct BinaryStatsState {
     for (const auto& e : index) fwrite(&e, sizeof(e), 1, file);
     // patch file header
     fseek(file, 0, SEEK_SET);
-    Vbs1Header hdr = {};
-    hdr.magic[0]='V'; hdr.magic[1]='B'; hdr.magic[2]='S'; hdr.magic[3]='1';
+    Vbs2Header hdr = {};
+    hdr.magic[0]='V'; hdr.magic[1]='B'; hdr.magic[2]='S'; hdr.magic[3]='2';
     hdr.width = seqWidth; hdr.height = seqHeight;
     hdr.num_frames = numFrames; hdr.index_offset = idxOff;
     fwrite(&hdr, sizeof(hdr), 1, file);
@@ -224,10 +265,10 @@ static void writeAllCodedDataBinary(const CodingStructure& cs, const UnitArea& c
       if (!isLuma(chType)) continue;
 
       const int poc = cs.picture->poc;
-      g_binStats.beginFrame(poc);
+      g_binStats.beginFrame(poc, cs.slice);
       if (!g_binStats.file) return;
 
-      Vbs1CuCommon common;
+      Vbs2CuCommon common;
       common.x = (uint16_t)cu.lx();
       common.y = (uint16_t)cu.ly();
       common.w = (uint8_t)cu.lwidth();
@@ -241,7 +282,7 @@ static void writeAllCodedDataBinary(const CodingStructure& cs, const UnitArea& c
       {
       case MODE_INTRA:
       {
-        Vbs1CuIntra ext = {};
+        Vbs2CuIntra ext = {};
         for (const PredictionUnit &pu : CU::traversePUs(cu))
         {
           if (pu.Y().valid())
@@ -257,7 +298,7 @@ static void writeAllCodedDataBinary(const CodingStructure& cs, const UnitArea& c
       }
       case MODE_INTER:
       {
-        Vbs1CuInter ext = {};
+        Vbs2CuInter ext = {};
         ext.skip = cu.skip ? 1 : 0;
         for (const PredictionUnit &pu : CU::traversePUs(cu))
         {
@@ -290,6 +331,7 @@ static void writeAllCodedDataBinary(const CodingStructure& cs, const UnitArea& c
         break;
       }
       g_binStats.frameCuCount++;
+      g_binStats.qpSum += cu.qp;
     }
   }
 }
@@ -757,7 +799,7 @@ void writeBlockStatisticsHeader(const SPS *sps)
       (uint16_t)sps->getMaxPicWidthInLumaSamples(),
       (uint16_t)sps->getMaxPicHeightInLumaSamples());
     // Suppress text header for binary mode by writing a brief note to dtrace
-    DTRACE_HEADER( g_trace_ctx, "# VoidPlayer Binary Stats (.vbs1) — see %s\n", binaryStatsPath());
+    DTRACE_HEADER( g_trace_ctx, "# VoidPlayer Binary Stats (.vbs2) — see %s\n", binaryStatsPath());
   }
   else if (isCompactStatsMode())
   {
