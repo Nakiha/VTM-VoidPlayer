@@ -43,6 +43,256 @@
 #include "CommonLib/UnitTools.h"
 //#include "CommonLib/CodingStructure.h"
 #include <queue>
+#include <cstdlib>
+#include <sstream>
+
+// ---------------------------------------------------------------------------
+// Stats output mode selection via environment variables:
+//   VTM_BINARY_STATS=<filepath>  → binary VBS1 format (preferred)
+//   VTM_COMPACT_STATS=1          → text compact (one line per CU)
+//   (neither)                    → original verbose VTM format
+// ---------------------------------------------------------------------------
+
+static bool isCompactStatsMode()
+{
+  static int s_mode = -1;
+  if (s_mode == -1)
+  {
+    const char* env = std::getenv("VTM_COMPACT_STATS");
+    s_mode = (env && std::string(env) == "1") ? 1 : 0;
+  }
+  return s_mode == 1;
+}
+
+static const char* binaryStatsPath()
+{
+  static const char* s_path = (const char*)-1;
+  if (s_path == (const char*)-1)
+  {
+    s_path = std::getenv("VTM_BINARY_STATS");
+    if (s_path && s_path[0] == '\0') s_path = nullptr;
+  }
+  return s_path;
+}
+
+static bool isBinaryStatsMode() { return binaryStatsPath() != nullptr; }
+
+// ===========================================================================
+// VBS1 Binary Stats Format
+// ===========================================================================
+//
+// File layout:
+//   [Vbs1Header  16 bytes]
+//   [Frame 0: Vbs1FrameHeader(8B) + CU records ...]
+//   [Frame 1: ...]
+//   ...
+//   [Frame Index: Vbs1IndexEntry(8B) × num_frames]
+//
+// CU record (variable length):
+//   Common (9B):  x(2) y(2) w(1) h(1) depth(1) qp(1) pred_mode(1)
+//   If intra (+3B): intra_mode(1) mip(1) isp(1)
+//   If inter (+13B): skip(1) merge(1) inter_dir(1) mvL0(4) mvL1(4) refL0(1) refL1(1)
+
+#pragma pack(push, 1)
+struct Vbs1Header {
+  char     magic[4];       // "VBS1"
+  uint16_t width;
+  uint16_t height;
+  uint32_t num_frames;     // filled at finalize
+  uint32_t index_offset;   // filled at finalize
+};
+struct Vbs1FrameHeader {
+  int32_t  poc;
+  int32_t  num_cus;        // filled when frame completes
+};
+struct Vbs1CuCommon {
+  uint16_t x;
+  uint16_t y;
+  uint8_t  w;
+  uint8_t  h;
+  uint8_t  depth;
+  uint8_t  qp;
+  uint8_t  pred_mode;      // 0=inter 1=intra 2=ibc 3=plt
+};
+struct Vbs1CuIntra {
+  uint8_t  intra_mode;
+  uint8_t  mip_flag;
+  uint8_t  isp_mode;
+};
+struct Vbs1CuInter {
+  uint8_t  skip;
+  uint8_t  merge_flag;
+  uint8_t  inter_dir;
+  int16_t  mv_l0_x;
+  int16_t  mv_l0_y;
+  int16_t  mv_l1_x;
+  int16_t  mv_l1_y;
+  int8_t   ref_l0;
+  int8_t   ref_l1;
+};
+struct Vbs1IndexEntry {
+  uint32_t offset;         // file offset of Vbs1FrameHeader
+  uint32_t num_cus;
+};
+#pragma pack(pop)
+
+struct BinaryStatsState {
+  FILE*   file = nullptr;
+  int     currentPoc = -1;
+  long    frameHeaderPos = 0;
+  uint32_t frameCuCount = 0;
+  uint32_t numFrames = 0;
+  uint16_t seqWidth = 0;
+  uint16_t seqHeight = 0;
+  std::vector<Vbs1IndexEntry> index;
+
+  bool open() {
+    if (file) return true;
+    const char* path = binaryStatsPath();
+    if (!path) return false;
+    file = fopen(path, "wb");
+    if (!file) { fprintf(stderr, "VTM_BINARY_STATS: cannot open %s\n", path); return false; }
+    // write placeholder header (filled at finalize)
+    Vbs1Header hdr = {};
+    hdr.magic[0]='V'; hdr.magic[1]='B'; hdr.magic[2]='S'; hdr.magic[3]='1';
+    hdr.width = 0; hdr.height = 0;
+    hdr.num_frames = 0; hdr.index_offset = 0;
+    fwrite(&hdr, sizeof(hdr), 1, file);
+    return true;
+  }
+
+  void setDimensions(uint16_t w, uint16_t h) {
+    seqWidth = w; seqHeight = h;
+  }
+
+  void beginFrame(int poc) {
+    if (!file) return;
+    if (currentPoc == poc) return;  // same frame, different CTU
+    if (currentPoc >= 0) endFrame();
+    currentPoc = poc;
+    frameCuCount = 0;
+    frameHeaderPos = ftell(file);
+    Vbs1FrameHeader fh = { poc, 0 };
+    fwrite(&fh, sizeof(fh), 1, file);
+  }
+
+  void endFrame() {
+    if (!file || currentPoc < 0) return;
+    // patch frame header with actual CU count
+    long saved = ftell(file);
+    fseek(file, frameHeaderPos, SEEK_SET);
+    Vbs1FrameHeader fh = { currentPoc, (int32_t)frameCuCount };
+    fwrite(&fh, sizeof(fh), 1, file);
+    fseek(file, saved, SEEK_SET);
+    index.push_back({ (uint32_t)frameHeaderPos, frameCuCount });
+    numFrames++;
+    currentPoc = -1;
+  }
+
+  void finalize() {
+    if (!file) return;
+    endFrame();
+    // write frame index
+    uint32_t idxOff = (uint32_t)ftell(file);
+    for (const auto& e : index) fwrite(&e, sizeof(e), 1, file);
+    // patch file header
+    fseek(file, 0, SEEK_SET);
+    Vbs1Header hdr = {};
+    hdr.magic[0]='V'; hdr.magic[1]='B'; hdr.magic[2]='S'; hdr.magic[3]='1';
+    hdr.width = seqWidth; hdr.height = seqHeight;
+    hdr.num_frames = numFrames; hdr.index_offset = idxOff;
+    fwrite(&hdr, sizeof(hdr), 1, file);
+    fclose(file); file = nullptr;
+  }
+
+  ~BinaryStatsState() { finalize(); }
+};
+
+static BinaryStatsState g_binStats;
+
+static void writeAllCodedDataBinary(const CodingStructure& cs, const UnitArea& ctuArea)
+{
+  const int nShift = MV_FRACTIONAL_BITS_DIFF;
+  const int nOffset = 1 << (nShift - 1);
+  const int maxNumChannelType = isChromaEnabled(cs.pcv->chrFormat) && CS::isDualITree(cs) ? 2 : 1;
+
+  for (int ch = 0; ch < maxNumChannelType; ch++)
+  {
+    const ChannelType chType = ChannelType(ch);
+    for (const CodingUnit &cu : cs.traverseCUs(CS::getArea(cs, ctuArea, chType), chType))
+    {
+      if (!isLuma(chType)) continue;
+
+      const int poc = cs.picture->poc;
+      g_binStats.beginFrame(poc);
+      if (!g_binStats.file) return;
+
+      Vbs1CuCommon common;
+      common.x = (uint16_t)cu.lx();
+      common.y = (uint16_t)cu.ly();
+      common.w = (uint8_t)cu.lwidth();
+      common.h = (uint8_t)cu.lheight();
+      common.depth = cu.depth;
+      common.qp = (uint8_t)cu.qp;
+      common.pred_mode = (uint8_t)cu.predMode;
+      fwrite(&common, sizeof(common), 1, g_binStats.file);
+
+      switch (cu.predMode)
+      {
+      case MODE_INTRA:
+      {
+        Vbs1CuIntra ext = {};
+        for (const PredictionUnit &pu : CU::traversePUs(cu))
+        {
+          if (pu.Y().valid())
+          {
+            ext.intra_mode = (uint8_t)PU::getFinalIntraMode(pu, ChannelType::LUMA);
+            ext.mip_flag = cu.mipFlag ? 1 : 0;
+            ext.isp_mode = (uint8_t)to_uint(cu.ispMode);
+            break;
+          }
+        }
+        fwrite(&ext, sizeof(ext), 1, g_binStats.file);
+        break;
+      }
+      case MODE_INTER:
+      {
+        Vbs1CuInter ext = {};
+        ext.skip = cu.skip ? 1 : 0;
+        for (const PredictionUnit &pu : CU::traversePUs(cu))
+        {
+          ext.merge_flag = pu.mergeFlag ? 1 : 0;
+          ext.inter_dir = (uint8_t)pu.interDir;
+          if (pu.interDir != 2)
+          {
+            Mv mv = pu.mv[REF_PIC_LIST_0];
+            mv.hor = mv.hor >= 0 ? (mv.hor + nOffset) >> nShift : -((-mv.hor + nOffset) >> nShift);
+            mv.ver = mv.ver >= 0 ? (mv.ver + nOffset) >> nShift : -((-mv.ver + nOffset) >> nShift);
+            ext.mv_l0_x = (int16_t)mv.hor;
+            ext.mv_l0_y = (int16_t)mv.ver;
+          }
+          if (pu.interDir != 1)
+          {
+            Mv mv = pu.mv[REF_PIC_LIST_1];
+            mv.hor = mv.hor >= 0 ? (mv.hor + nOffset) >> nShift : -((-mv.hor + nOffset) >> nShift);
+            mv.ver = mv.ver >= 0 ? (mv.ver + nOffset) >> nShift : -((-mv.ver + nOffset) >> nShift);
+            ext.mv_l1_x = (int16_t)mv.hor;
+            ext.mv_l1_y = (int16_t)mv.ver;
+          }
+          ext.ref_l0 = (int8_t)pu.refIdx[REF_PIC_LIST_0];
+          ext.ref_l1 = (int8_t)pu.refIdx[REF_PIC_LIST_1];
+          break;
+        }
+        fwrite(&ext, sizeof(ext), 1, g_binStats.file);
+        break;
+      }
+      default:
+        break;
+      }
+      g_binStats.frameCuCount++;
+    }
+  }
+}
 
 #define BLOCK_STATS_POLYGON_MIN_POINTS                    3
 #define BLOCK_STATS_POLYGON_MAX_POINTS                    5
@@ -500,21 +750,44 @@ void writeBlockStatisticsHeader(const SPS *sps)
     return;
   }
 
-  DTRACE_HEADER( g_trace_ctx, "# VTMBMS Block Statistics\n");
-  // sequence info
-  DTRACE_HEADER( g_trace_ctx, "# Sequence size: [%dx %d]\n", sps->getMaxPicWidthInLumaSamples(), sps->getMaxPicHeightInLumaSamples() );
-  // list statistics
-  for( auto i = static_cast<int>(BlockStatistic::PredMode); i < static_cast<int>(BlockStatistic::NumBlockStatistics); i++)
+  if (isBinaryStatsMode())
   {
-    BlockStatistic statistic = BlockStatistic(i);
-    std::string statitic_name = GetBlockStatisticName(statistic);
-    std::string statitic_type = GetBlockStatisticTypeString(statistic);
-    std::string statitic_type_specific_info = GetBlockStatisticTypeSpecificInfo(statistic);
-    DTRACE_HEADER( g_trace_ctx, "# Block Statistic Type: %s; %s; %s\n", statitic_name.c_str(), statitic_type.c_str(), statitic_type_specific_info.c_str());
+    g_binStats.open();
+    g_binStats.setDimensions(
+      (uint16_t)sps->getMaxPicWidthInLumaSamples(),
+      (uint16_t)sps->getMaxPicHeightInLumaSamples());
+    // Suppress text header for binary mode by writing a brief note to dtrace
+    DTRACE_HEADER( g_trace_ctx, "# VoidPlayer Binary Stats (.vbs1) — see %s\n", binaryStatsPath());
+  }
+  else if (isCompactStatsMode())
+  {
+    DTRACE_HEADER( g_trace_ctx, "# VoidPlayer Compact Block Statistics\n");
+    DTRACE_HEADER( g_trace_ctx, "# Sequence size: %dx%d\n", sps->getMaxPicWidthInLumaSamples(), sps->getMaxPicHeightInLumaSamples() );
+    DTRACE_HEADER( g_trace_ctx, "# Columns: poc x y w h depth qp pred\n");
+    DTRACE_HEADER( g_trace_ctx, "# Intra extends: intra_mode mip isp\n");
+    DTRACE_HEADER( g_trace_ctx, "# Inter extends: skip merge interDir mvL0x mvL0y mvL1x mvL1y refL0 refL1\n");
+  }
+  else
+  {
+    DTRACE_HEADER( g_trace_ctx, "# VTMBMS Block Statistics\n");
+    // sequence info
+    DTRACE_HEADER( g_trace_ctx, "# Sequence size: [%dx %d]\n", sps->getMaxPicWidthInLumaSamples(), sps->getMaxPicHeightInLumaSamples() );
+    // list statistics
+    for( auto i = static_cast<int>(BlockStatistic::PredMode); i < static_cast<int>(BlockStatistic::NumBlockStatistics); i++)
+    {
+      BlockStatistic statistic = BlockStatistic(i);
+      std::string statitic_name = GetBlockStatisticName(statistic);
+      std::string statitic_type = GetBlockStatisticTypeString(statistic);
+      std::string statitic_type_specific_info = GetBlockStatisticTypeSpecificInfo(statistic);
+      DTRACE_HEADER( g_trace_ctx, "# Block Statistic Type: %s; %s; %s\n", statitic_name.c_str(), statitic_type.c_str(), statitic_type_specific_info.c_str());
+    }
   }
 
   has_header_been_written = true;
 }
+
+// Forward declaration
+static void writeAllCodedDataCompact(const CodingStructure& cs, const UnitArea& ctuArea);
 
 void getAndStoreBlockStatistics(const CodingStructure& cs, const UnitArea& ctuArea)
 {
@@ -525,7 +798,14 @@ void getAndStoreBlockStatistics(const CodingStructure& cs, const UnitArea& ctuAr
   CHECK(writeAll && writeCoded, "Either used D_BLOCK_STATISTICS_ALL or D_BLOCK_STATISTICS_CODED. Not both at once!")
 
   if (writeCoded)
-    writeAllCodedData(cs, ctuArea);    // this will write out important cu-based data, only if it is actually decoded and used
+  {
+    if (isBinaryStatsMode())
+      writeAllCodedDataBinary(cs, ctuArea);
+    else if (isCompactStatsMode())
+      writeAllCodedDataCompact(cs, ctuArea);
+    else
+      writeAllCodedData(cs, ctuArea);
+  }
   else if (writeAll)
     writeAllData(cs, ctuArea);         // this will write out all inter- or intra-prediction related data
 }
@@ -1219,4 +1499,106 @@ void writeAllCodedData(const CodingStructure & cs, const UnitArea & ctuArea)
     }
   }
 }
+
+// ===========================================================================
+// VoidPlayer Compact Stats: one line per CU, environment variable controlled
+// ===========================================================================
+
+static void writeAllCodedDataCompact(const CodingStructure& cs, const UnitArea& ctuArea)
+{
+  const int nShift = MV_FRACTIONAL_BITS_DIFF;
+  const int nOffset = 1 << (nShift - 1);
+  const int maxNumChannelType = isChromaEnabled(cs.pcv->chrFormat) && CS::isDualITree(cs) ? 2 : 1;
+
+  for (int ch = 0; ch < maxNumChannelType; ch++)
+  {
+    const ChannelType chType = ChannelType(ch);
+
+    for (const CodingUnit &cu : cs.traverseCUs(CS::getArea(cs, ctuArea, chType), chType))
+    {
+      if (!isLuma(chType))
+        continue; // skip chroma CU in compact mode for now
+
+      const int poc = cs.picture->poc;
+      const int cx  = cu.lx();
+      const int cy  = cu.ly();
+      const int cw  = cu.lwidth();
+      const int ch_ = cu.lheight();
+
+      // Base CU info: poc x y w h depth qp pred
+      // Cast uint8_t/bool/enum to int to avoid ostringstream treating them as chars
+      std::ostringstream line;
+      line << "CU " << poc << " " << cx << " " << cy << " " << cw << " " << ch_ << " "
+           << int(cu.depth) << " " << int(cu.qp) << " " << int(cu.predMode);
+
+      switch (cu.predMode)
+      {
+      case MODE_INTRA:
+      {
+        // intra: intra_mode mip isp
+        for (const PredictionUnit &pu : CU::traversePUs(cu))
+        {
+          if (pu.Y().valid())
+          {
+            line << " " << PU::getFinalIntraMode(pu, ChannelType::LUMA);
+            line << " " << int(cu.mipFlag);
+            line << " " << to_uint(cu.ispMode);
+            break; // one PU is enough for compact mode
+          }
+        }
+        break;
+      }
+      case MODE_INTER:
+      {
+        // inter: skip merge interDir mvL0x mvL0y mvL1x mvL1y refL0 refL1
+        line << " " << int(cu.skip);
+
+        for (const PredictionUnit &pu : CU::traversePUs(cu))
+        {
+          line << " " << int(pu.mergeFlag);
+          line << " " << int(pu.interDir);
+
+          // L0 MV
+          if (pu.interDir != 2 /* not PRED_L1 only */)
+          {
+            Mv mv = pu.mv[REF_PIC_LIST_0];
+            mv.hor = mv.hor >= 0 ? (mv.hor + nOffset) >> nShift : -((-mv.hor + nOffset) >> nShift);
+            mv.ver = mv.ver >= 0 ? (mv.ver + nOffset) >> nShift : -((-mv.ver + nOffset) >> nShift);
+            line << " " << mv.hor << " " << mv.ver;
+          }
+          else
+          {
+            line << " 0 0";
+          }
+
+          // L1 MV
+          if (pu.interDir != 1 /* not PRED_L0 only */)
+          {
+            Mv mv = pu.mv[REF_PIC_LIST_1];
+            mv.hor = mv.hor >= 0 ? (mv.hor + nOffset) >> nShift : -((-mv.hor + nOffset) >> nShift);
+            mv.ver = mv.ver >= 0 ? (mv.ver + nOffset) >> nShift : -((-mv.ver + nOffset) >> nShift);
+            line << " " << mv.hor << " " << mv.ver;
+          }
+          else
+          {
+            line << " 0 0";
+          }
+
+          line << " " << int(pu.refIdx[REF_PIC_LIST_0]);
+          line << " " << int(pu.refIdx[REF_PIC_LIST_1]);
+          break; // one PU is enough for compact mode
+        }
+        break;
+      }
+      default:
+        break;
+      }
+
+      line << "\n";
+      const std::string str = line.str();
+      g_trace_ctx->dtrace<false>(D_BLOCK_STATISTICS_CODED, "%s", str.c_str());
+    }
+  }
+}
+
 #endif
