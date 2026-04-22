@@ -40,6 +40,8 @@
 #include <vector>
 #include <stdio.h>
 #include <fcntl.h>
+#include <chrono>
+#include <cmath>
 
 #include "DecApp.h"
 #include "DecoderLib/AnnexBread.h"
@@ -79,6 +81,13 @@ DecApp::DecApp()
  */
 uint32_t DecApp::decode()
 {
+  // --- VoidPlayer perf counters ---
+  using Clock = std::chrono::steady_clock;
+  double t_decode = 0, t_loopFilter = 0, t_finishPic = 0, t_writeOutput = 0;
+  int frameCount = 0;
+  auto t_totalStart = Clock::now();
+  // --------------------------------
+
   int      poc;
   PicList *pcListPic = nullptr;
   
@@ -289,7 +298,9 @@ uint32_t DecApp::decode()
           }
 
           int skipFrameCounter = m_iSkipFrame;
+          { auto _t0 = Clock::now();
           m_cDecLib.decode(nalu, m_iSkipFrame, m_iPOCLastDisplay, m_targetOlsIdx);
+          t_decode += std::chrono::duration<double>(Clock::now() - _t0).count(); }
 
           if ( prevPicSkipped && nalu.m_nalUnitType == NAL_UNIT_CODED_SLICE_GDR )
           {
@@ -380,8 +391,18 @@ uint32_t DecApp::decode()
       {
         if (!loopFiltered[nalu.m_nuhLayerId] || bitstreamFile)
         {
-          m_cDecLib.executeLoopFilters();
+          // Skip loop filters in binary-stats-only mode (no pixel output needed)
+          const bool binaryStatsOnly = std::getenv("VTM_BINARY_STATS") != nullptr;
+          if (!binaryStatsOnly)
+          {
+            { auto _t0 = Clock::now();
+            m_cDecLib.executeLoopFilters();
+            t_loopFilter += std::chrono::duration<double>(Clock::now() - _t0).count(); }
+          }
+          { auto _t0 = Clock::now();
           m_cDecLib.finishPicture(poc, pcListPic, INFO, m_newCLVS[nalu.m_nuhLayerId]);
+          t_finishPic += std::chrono::duration<double>(Clock::now() - _t0).count(); }
+          frameCount++;
         }
         loopFiltered[nalu.m_nuhLayerId] = (nalu.m_nalUnitType == NAL_UNIT_EOS);
         if (nalu.m_nalUnitType == NAL_UNIT_EOS)
@@ -777,7 +798,9 @@ uint32_t DecApp::decode()
       if( bNewPicture )
       {
         setOutputPicturePresentInStream();
+        { auto _t0 = Clock::now();
         xWriteOutput( pcListPic, nalu.m_temporalId );
+        t_writeOutput += std::chrono::duration<double>(Clock::now() - _t0).count(); }
       }
       if (nalu.m_nalUnitType == NAL_UNIT_EOS)
       {
@@ -878,6 +901,21 @@ uint32_t DecApp::decode()
 
   // get the number of checksum errors
   uint32_t nRet = m_cDecLib.getNumberOfChecksumErrorsDetected();
+
+  // --- VoidPlayer perf summary ---
+  double t_total = std::chrono::duration<double>(Clock::now() - t_totalStart).count();
+  fprintf(stderr, "\n===== VoidPlayer Perf Summary =====\n");
+  fprintf(stderr, "  Frames:          %d\n", frameCount);
+  fprintf(stderr, "  Total:           %.3f s\n", t_total);
+  fprintf(stderr, "  decode():        %.3f s (%.1f%%)\n", t_decode, t_decode/t_total*100);
+  fprintf(stderr, "  loopFilters():   %.3f s (%.1f%%)\n", t_loopFilter, t_loopFilter/t_total*100);
+  fprintf(stderr, "  finishPicture(): %.3f s (%.1f%%)\n", t_finishPic, t_finishPic/t_total*100);
+  fprintf(stderr, "  writeOutput():   %.3f s (%.1f%%)\n", t_writeOutput, t_writeOutput/t_total*100);
+  fprintf(stderr, "  other:           %.3f s (%.1f%%)\n",
+    t_total - t_decode - t_loopFilter - t_finishPic - t_writeOutput,
+    (t_total - t_decode - t_loopFilter - t_finishPic - t_writeOutput)/t_total*100);
+  fprintf(stderr, "===================================\n");
+  // ---------------------------------
 
   // delete buffers
   m_cDecLib.deletePicBuffer();

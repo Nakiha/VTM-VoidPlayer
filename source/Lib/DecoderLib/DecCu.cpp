@@ -51,6 +51,7 @@
 #include "CommonLib/ChromaFormat.h"
 #include "CommonLib/dtrace_blockstatistics.h"
 #endif
+#include <cstdlib>
 
 //! \ingroup DecoderLib
 //! \{
@@ -98,6 +99,7 @@ void DecCu::destoryDecCuReshaprBuf()
 
 void DecCu::decompressCtu( CodingStructure& cs, const UnitArea& ctuArea )
 {
+  static const bool s_binaryStatsOnly = std::getenv("VTM_BINARY_STATS") != nullptr;
   const int maxNumChannelType = isChromaEnabled(cs.pcv->chrFormat) && CS::isDualITree(cs) ? 2 : 1;
 
   if (cs.resetIBCBuffer)
@@ -138,24 +140,32 @@ void DecCu::decompressCtu( CodingStructure& cs, const UnitArea& ctuArea )
         }
 #endif
       }
-      switch( currCU.predMode )
+      if( s_binaryStatsOnly )
       {
-      case MODE_INTER:
-      case MODE_IBC:
-        xReconInter( currCU );
-        break;
-      case MODE_PLT:
-      case MODE_INTRA:
-        xReconIntraQT( currCU );
-        break;
-      default:
-        THROW( "Invalid prediction mode" );
-        break;
+        // Skip pixel reconstruction — only CU/PU structure needed for stats
+        cs.setDecomp( currCU );
       }
+      else
+      {
+        switch( currCU.predMode )
+        {
+        case MODE_INTER:
+        case MODE_IBC:
+          xReconInter( currCU );
+          break;
+        case MODE_PLT:
+        case MODE_INTRA:
+          xReconIntraQT( currCU );
+          break;
+        default:
+          THROW( "Invalid prediction mode" );
+          break;
+        }
 
-      m_pcInterPred->xFillIBCBuffer(currCU);
+        m_pcInterPred->xFillIBCBuffer(currCU);
 
-      DTRACE_BLOCK_REC( cs.picture->getRecoBuf( currCU ), currCU, currCU.predMode );
+        DTRACE_BLOCK_REC( cs.picture->getRecoBuf( currCU ), currCU, currCU.predMode );
+      }
     }
   }
 #if K0149_BLOCK_STATISTICS
