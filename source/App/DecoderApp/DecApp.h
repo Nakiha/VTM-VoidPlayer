@@ -45,6 +45,8 @@
 #include "DecoderLib/DecLib.h"
 #include "DecAppCfg.h"
 
+#include <istream>
+
 //! \ingroup DecoderApp
 //! \{
 
@@ -115,10 +117,10 @@ private:
   void  xFlushOutput( PicList* pcListPic, const int layerId = NOT_VALID ); ///< flush all remaining decoded pictures to file
 
   // check if next NAL unit will be the first NAL unit from a new picture
-  bool isNewPicture(std::ifstream *bitstreamFile, class InputByteStream *bytestream);
+  bool isNewPicture(std::istream *bitstreamFile, class InputByteStream *bytestream);
 
   // check if next NAL unit will be the first NAL unit from a new access unit
-  bool isNewAccessUnit(bool newPicture, std::ifstream *bitstreamFile, class InputByteStream *bytestream);
+  bool isNewAccessUnit(bool newPicture, std::istream *bitstreamFile, class InputByteStream *bytestream);
 
   void  writeLineToOutputLog(Picture * pcPic);
   void xOutputAnnotatedRegions(PicList* pcListPic);

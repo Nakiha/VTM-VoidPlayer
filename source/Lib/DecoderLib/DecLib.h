@@ -61,6 +61,8 @@
 #include "SEIDigitallySignedContent.h"
 #endif
 
+#include <istream>
+
 #if JVET_AJ0151_DSC_SEI
 struct binNalUnit
 {
@@ -361,8 +363,8 @@ public:
   }
 
   void  setAPSMapEnc(EnumArray<ParameterSetMap<APS>, ApsType> *apsMap) { m_apsMapEnc = apsMap; }
-  bool  isNewPicture( std::ifstream *bitstreamFile, class InputByteStream *bytestream );
-  bool  isNewAccessUnit( bool newPicture, std::ifstream *bitstreamFile, class InputByteStream *bytestream );
+  bool  isNewPicture( std::istream *bitstreamFile, class InputByteStream *bytestream );
+  bool  isNewAccessUnit( bool newPicture, std::istream *bitstreamFile, class InputByteStream *bytestream );
 
   bool      getHTidExternalSetFlag()               const { return m_mTidExternalSet; }
   void      setHTidExternalSetFlag(bool mTidExternalSet)  { m_mTidExternalSet = mTidExternalSet; }

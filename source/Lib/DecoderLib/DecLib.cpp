@@ -45,6 +45,7 @@
 #include "CommonLib/ProfileTierLevel.h"
 
 #include <fstream>
+#include <istream>
 #include <set>
 #include <stdio.h>
 #include <fcntl.h>
@@ -4338,7 +4339,7 @@ uint32_t DecLib::xGetNnpfaTargetId(uint8_t* payload, uint32_t payloadSize)
 /**
 - lookahead through next NAL units to determine if current NAL unit is the first NAL unit in a new picture
 */
-bool DecLib::isNewPicture(std::ifstream *bitstreamFile, class InputByteStream *bytestream)
+bool DecLib::isNewPicture(std::istream *bitstreamFile, class InputByteStream *bytestream)
 {
   bool ret = false;
   bool finished = false;
@@ -4450,7 +4451,7 @@ bool DecLib::isNewPicture(std::ifstream *bitstreamFile, class InputByteStream *b
 /**
 - lookahead through next NAL units to determine if current NAL unit is the first NAL unit in a new access unit
 */
-bool DecLib::isNewAccessUnit( bool newPicture, std::ifstream *bitstreamFile, class InputByteStream *bytestream )
+bool DecLib::isNewAccessUnit( bool newPicture, std::istream *bitstreamFile, class InputByteStream *bytestream )
 {
   bool ret = false;
   bool finished = false;

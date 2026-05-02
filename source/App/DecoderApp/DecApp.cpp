@@ -38,10 +38,17 @@
 #include <list>
 #include <numeric>
 #include <vector>
+#include <algorithm>
+#include <deque>
+#include <cstdlib>
+#include <memory>
 #include <stdio.h>
 #include <fcntl.h>
 #include <chrono>
 #include <cmath>
+#if defined(_WIN32)
+#include <io.h>
+#endif
 
 #include "DecApp.h"
 #include "DecoderLib/AnnexBread.h"
@@ -53,6 +60,260 @@
 
 //! \ingroup DecoderApp
 //! \{
+
+namespace {
+
+constexpr uint64_t VOIDPLAYER_DEFAULT_STDIN_WINDOW_BYTES = 64ull * 1024ull * 1024ull;
+constexpr uint64_t VOIDPLAYER_DEFAULT_STDIN_HARD_CAP_BYTES = 256ull * 1024ull * 1024ull;
+constexpr size_t VOIDPLAYER_DEFAULT_STDIN_WINDOW_NALUS = 4096;
+
+uint64_t voidPlayerStdinWindowBytes()
+{
+  const char* env = std::getenv("VOID_VTM_STDIN_WINDOW_BYTES");
+  if (!env || env[0] == '\0')
+  {
+    return VOIDPLAYER_DEFAULT_STDIN_WINDOW_BYTES;
+  }
+  char* end = nullptr;
+  const unsigned long long parsed = std::strtoull(env, &end, 10);
+  if (end == env || parsed < 1024ull * 1024ull)
+  {
+    return VOIDPLAYER_DEFAULT_STDIN_WINDOW_BYTES;
+  }
+  return static_cast<uint64_t>(parsed);
+}
+
+size_t voidPlayerStdinWindowNalus()
+{
+  const char* env = std::getenv("VOID_VTM_STDIN_WINDOW_NALUS");
+  if (!env || env[0] == '\0')
+  {
+    return VOIDPLAYER_DEFAULT_STDIN_WINDOW_NALUS;
+  }
+  char* end = nullptr;
+  const unsigned long long parsed = std::strtoull(env, &end, 10);
+  if (end == env || parsed < 16ull)
+  {
+    return VOIDPLAYER_DEFAULT_STDIN_WINDOW_NALUS;
+  }
+  return static_cast<size_t>(parsed);
+}
+
+uint64_t voidPlayerStdinHardCapBytes(uint64_t windowBytes)
+{
+  const char* env = std::getenv("VOID_VTM_STDIN_HARD_CAP_BYTES");
+  if (!env || env[0] == '\0')
+  {
+    return std::max(VOIDPLAYER_DEFAULT_STDIN_HARD_CAP_BYTES, windowBytes);
+  }
+  char* end = nullptr;
+  const unsigned long long parsed = std::strtoull(env, &end, 10);
+  if (end == env || parsed < windowBytes)
+  {
+    return std::max(VOIDPLAYER_DEFAULT_STDIN_HARD_CAP_BYTES, windowBytes);
+  }
+  return static_cast<uint64_t>(parsed);
+}
+
+class SlidingStdinStreamBuf : public std::streambuf
+{
+public:
+  SlidingStdinStreamBuf(uint64_t windowBytes, size_t windowNalus, uint64_t hardCapBytes)
+    : m_windowBytes(windowBytes)
+    , m_windowNalus(windowNalus)
+    , m_hardCapBytes(std::max(hardCapBytes, windowBytes))
+  {
+  }
+
+protected:
+  int_type underflow() override
+  {
+    if (!ensureAvailable(m_pos))
+    {
+      return traits_type::eof();
+    }
+    return traits_type::to_int_type(byteAt(m_pos));
+  }
+
+  int_type uflow() override
+  {
+    if (!ensureAvailable(m_pos))
+    {
+      return traits_type::eof();
+    }
+    const char c = byteAt(m_pos);
+    ++m_pos;
+    trimWindow();
+    return traits_type::to_int_type(c);
+  }
+
+  pos_type seekoff(off_type off, std::ios_base::seekdir way, std::ios_base::openmode which) override
+  {
+    if ((which & std::ios_base::in) == 0)
+    {
+      return pos_type(off_type(-1));
+    }
+
+    int64_t base = 0;
+    switch (way)
+    {
+    case std::ios_base::beg:
+      base = 0;
+      break;
+    case std::ios_base::cur:
+      base = static_cast<int64_t>(m_pos);
+      break;
+    case std::ios_base::end:
+      if (!readUntilEof())
+      {
+        return pos_type(off_type(-1));
+      }
+      base = static_cast<int64_t>(m_loadedEnd);
+      break;
+    default:
+      return pos_type(off_type(-1));
+    }
+
+    const int64_t next = base + static_cast<int64_t>(off);
+    if (next < 0)
+    {
+      return pos_type(off_type(-1));
+    }
+    return seekpos(pos_type(next), which);
+  }
+
+  pos_type seekpos(pos_type pos, std::ios_base::openmode which) override
+  {
+    if ((which & std::ios_base::in) == 0)
+    {
+      return pos_type(off_type(-1));
+    }
+
+    const uint64_t next = static_cast<uint64_t>(pos);
+    if (next < m_windowStart)
+    {
+      std::fprintf(stderr,
+                   "VoidPlayer stdin window underrun: requested=%llu window_start=%llu "
+                   "loaded_end=%llu window_bytes=%llu window_nalus=%zu hard_cap=%llu\n",
+                   static_cast<unsigned long long>(next),
+                   static_cast<unsigned long long>(m_windowStart),
+                   static_cast<unsigned long long>(m_loadedEnd),
+                   static_cast<unsigned long long>(m_windowBytes),
+                   m_windowNalus,
+                   static_cast<unsigned long long>(m_hardCapBytes));
+      return pos_type(off_type(-1));
+    }
+    if (!ensureAvailable(next) && next != m_loadedEnd)
+    {
+      return pos_type(off_type(-1));
+    }
+    m_pos = next;
+    return pos_type(static_cast<off_type>(m_pos));
+  }
+
+private:
+  bool ensureAvailable(uint64_t absolutePos)
+  {
+    while (absolutePos >= m_loadedEnd && !m_eof)
+    {
+      readChunk();
+    }
+    return absolutePos >= m_windowStart && absolutePos < m_loadedEnd;
+  }
+
+  bool readUntilEof()
+  {
+    while (!m_eof)
+    {
+      readChunk();
+    }
+    return true;
+  }
+
+  void readChunk()
+  {
+    char buf[64 * 1024];
+    const size_t n = std::fread(buf, 1, sizeof(buf), stdin);
+    if (n == 0)
+    {
+      m_eof = true;
+      return;
+    }
+    for (size_t i = 0; i < n; ++i)
+    {
+      appendByte(buf[i], m_loadedEnd + static_cast<uint64_t>(i));
+    }
+    m_loadedEnd += static_cast<uint64_t>(n);
+    trimWindow();
+  }
+
+  void appendByte(char value, uint64_t absolutePos)
+  {
+    const unsigned char byte = static_cast<unsigned char>(value);
+    if (byte == 1 && m_zeroRun >= 2)
+    {
+      const uint64_t prefixZeros = m_zeroRun >= 3 ? 3 : m_zeroRun;
+      const uint64_t start = absolutePos >= prefixZeros ? absolutePos - prefixZeros : 0;
+      if (m_naluStarts.empty() || m_naluStarts.back() != start)
+      {
+        m_naluStarts.push_back(start);
+      }
+    }
+
+    if (byte == 0)
+    {
+      ++m_zeroRun;
+    }
+    else
+    {
+      m_zeroRun = 0;
+    }
+    m_window.push_back(value);
+  }
+
+  char byteAt(uint64_t absolutePos) const
+  {
+    return m_window[static_cast<size_t>(absolutePos - m_windowStart)];
+  }
+
+  void trimWindow()
+  {
+    const uint64_t byteFloor = m_loadedEnd > m_windowBytes
+      ? m_loadedEnd - m_windowBytes
+      : 0;
+    const uint64_t naluFloor = m_naluStarts.size() > m_windowNalus
+      ? m_naluStarts[m_naluStarts.size() - m_windowNalus]
+      : 0;
+    uint64_t trimFloor = std::min(byteFloor, naluFloor);
+    if (m_loadedEnd > m_hardCapBytes)
+    {
+      trimFloor = std::max(trimFloor, m_loadedEnd - m_hardCapBytes);
+    }
+
+    while (m_windowStart < trimFloor && !m_window.empty())
+    {
+      m_window.pop_front();
+      ++m_windowStart;
+    }
+    while (!m_naluStarts.empty() && m_naluStarts.front() < m_windowStart)
+    {
+      m_naluStarts.pop_front();
+    }
+  }
+
+  const uint64_t m_windowBytes;
+  const size_t m_windowNalus;
+  const uint64_t m_hardCapBytes;
+  std::deque<char> m_window;
+  std::deque<uint64_t> m_naluStarts;
+  uint64_t m_windowStart = 0;
+  uint64_t m_loadedEnd = 0;
+  uint64_t m_pos = 0;
+  uint64_t m_zeroRun = 0;
+  bool m_eof = false;
+};
+
+} // namespace
 
 // ====================================================================================================================
 // Constructor / destructor / initialization / destroy
@@ -102,13 +363,33 @@ uint32_t DecApp::decode()
   bitstreamSize.close();
 #endif
 
-  std::ifstream bitstreamFile(m_bitstreamFileName.c_str(), std::ifstream::in | std::ifstream::binary);
-  if (!bitstreamFile)
+  std::ifstream bitstreamFileStorage;
+  std::unique_ptr<SlidingStdinStreamBuf> stdinStreamBuf;
+  std::unique_ptr<std::istream> stdinStream;
+  std::istream* bitstreamFile = nullptr;
+  if (m_bitstreamFileName == "-")
   {
-    EXIT( "Failed to open bitstream file " << m_bitstreamFileName.c_str() << " for reading" ) ;
+#if defined(_WIN32)
+    _setmode(_fileno(stdin), _O_BINARY);
+#endif
+    stdinStreamBuf = std::make_unique<SlidingStdinStreamBuf>(
+      voidPlayerStdinWindowBytes(),
+      voidPlayerStdinWindowNalus(),
+      voidPlayerStdinHardCapBytes(voidPlayerStdinWindowBytes()));
+    stdinStream = std::make_unique<std::istream>(stdinStreamBuf.get());
+    bitstreamFile = stdinStream.get();
+  }
+  else
+  {
+    bitstreamFileStorage.open(m_bitstreamFileName.c_str(), std::ifstream::in | std::ifstream::binary);
+    if (!bitstreamFileStorage)
+    {
+      EXIT( "Failed to open bitstream file " << m_bitstreamFileName.c_str() << " for reading" ) ;
+    }
+    bitstreamFile = &bitstreamFileStorage;
   }
 
-  InputByteStream bytestream(bitstreamFile);
+  InputByteStream bytestream(*bitstreamFile);
 
   if (!m_outputDecodedSEIMessagesFilename.empty() && m_outputDecodedSEIMessagesFilename!="-")
   {
@@ -216,14 +497,14 @@ uint32_t DecApp::decode()
   int lastNaluLayerId = -1;
   bool decodedSliceInAU = false;
 
-  while (!!bitstreamFile)
+  while (!!(*bitstreamFile))
   {
     InputNALUnit nalu;
     nalu.m_nalUnitType = NAL_UNIT_INVALID;
 
     // determine if next NAL unit will be the first one from a new picture
-    bool bNewPicture = m_cDecLib.isNewPicture(&bitstreamFile, &bytestream);
-    bool bNewAccessUnit = bNewPicture && decodedSliceInAU && m_cDecLib.isNewAccessUnit( bNewPicture, &bitstreamFile, &bytestream );
+    bool bNewPicture = m_cDecLib.isNewPicture(bitstreamFile, &bytestream);
+    bool bNewAccessUnit = bNewPicture && decodedSliceInAU && m_cDecLib.isNewAccessUnit( bNewPicture, bitstreamFile, &bytestream );
     if(!bNewPicture)
     {
       AnnexBStats stats = AnnexBStats();
@@ -385,11 +666,11 @@ uint32_t DecApp::decode()
       nalu.m_nuhLayerId = lastNaluLayerId;
     }
 
-    if (bNewPicture || !bitstreamFile || nalu.m_nalUnitType == NAL_UNIT_EOS)
+    if (bNewPicture || !(*bitstreamFile) || nalu.m_nalUnitType == NAL_UNIT_EOS)
     {
       if (!m_cDecLib.getFirstSliceInSequence(nalu.m_nuhLayerId) && !bPicSkipped)
       {
-        if (!loopFiltered[nalu.m_nuhLayerId] || bitstreamFile)
+        if (!loopFiltered[nalu.m_nuhLayerId] || !!(*bitstreamFile))
         {
           // Skip loop filters in binary-stats-only mode (no pixel output needed)
           const bool binaryStatsOnly = std::getenv("VTM_BINARY_STATS") != nullptr;
@@ -828,12 +1109,12 @@ uint32_t DecApp::decode()
       isEosPresentInLastPu = isEosPresentInPu;
       isEosPresentInPu = false;
     }
-    if (bNewPicture || !bitstreamFile || nalu.m_nalUnitType == NAL_UNIT_EOS)
+    if (bNewPicture || !(*bitstreamFile) || nalu.m_nalUnitType == NAL_UNIT_EOS)
     {
       m_cDecLib.checkAPSInPictureUnit();
       m_cDecLib.resetPictureUnitNals();
     }
-    if (bNewAccessUnit || !bitstreamFile)
+    if (bNewAccessUnit || !(*bitstreamFile))
     {
       m_cDecLib.CheckNoOutputPriorPicFlagsInAccessUnit();
       m_cDecLib.resetAccessUnitNoOutputPriorPicFlags();
