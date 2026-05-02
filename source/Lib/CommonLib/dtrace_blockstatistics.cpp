@@ -43,13 +43,19 @@
 #include "CommonLib/UnitTools.h"
 #include "CommonLib/Slice.h"
 //#include "CommonLib/CodingStructure.h"
+#include <algorithm>
 #include <queue>
 #include <cstdlib>
+#include <cstdint>
+#include <cstdio>
 #include <sstream>
+#include <string>
+#include <vector>
 
 // ---------------------------------------------------------------------------
 // Stats output mode selection via environment variables:
-//   VTM_BINARY_STATS=<filepath>  → binary VBS1 format (preferred)
+//   VTM_BINARY_STATS=<filepath>          → binary VBS output
+//   VTM_BINARY_STATS_FORMAT=VBS2|VBS3    → binary VBS version, defaults to VBS2
 //   VTM_COMPACT_STATS=1          → text compact (one line per CU)
 //   (neither)                    → original verbose VTM format
 // ---------------------------------------------------------------------------
@@ -77,6 +83,57 @@ static const char* binaryStatsPath()
 }
 
 static bool isBinaryStatsMode() { return binaryStatsPath() != nullptr; }
+
+enum class BinaryStatsFormat
+{
+  Vbs2,
+  Vbs3,
+};
+
+static BinaryStatsFormat binaryStatsFormat()
+{
+  static BinaryStatsFormat s_format = []() {
+    const char* env = std::getenv("VTM_BINARY_STATS_FORMAT");
+    if (!env || env[0] == '\0')
+    {
+      return BinaryStatsFormat::Vbs2;
+    }
+    const std::string value(env);
+    if (value == "VBS3" || value == "vbs3" || value == "3")
+    {
+      return BinaryStatsFormat::Vbs3;
+    }
+    if (value != "VBS2" && value != "vbs2" && value != "2")
+    {
+      fprintf(stderr, "VTM_BINARY_STATS_FORMAT: unsupported value '%s', using VBS2\n", env);
+    }
+    return BinaryStatsFormat::Vbs2;
+  }();
+  return s_format;
+}
+
+static const char* binaryStatsFormatName()
+{
+  return binaryStatsFormat() == BinaryStatsFormat::Vbs3 ? "VBS3" : "VBS2";
+}
+
+static int64_t binaryTell(FILE* file)
+{
+#if defined(_WIN32)
+  return _ftelli64(file);
+#else
+  return static_cast<int64_t>(ftell(file));
+#endif
+}
+
+static bool binarySeek(FILE* file, uint64_t offset)
+{
+#if defined(_WIN32)
+  return _fseeki64(file, static_cast<int64_t>(offset), SEEK_SET) == 0;
+#else
+  return fseek(file, static_cast<long>(offset), SEEK_SET) == 0;
+#endif
+}
 
 // ===========================================================================
 // VBS2 Binary Stats Format
@@ -144,36 +201,135 @@ struct Vbs2IndexEntry {
   uint32_t offset;         // file offset of Vbs2FrameHeader
   uint32_t num_cus;
 };
+
+struct Vbs3Header {
+  char     magic[4];       // "VBS3"
+  uint16_t version_major;
+  uint16_t version_minor;
+  uint16_t header_size;
+  uint16_t section_entry_size;
+  uint32_t flags;
+  uint32_t width;
+  uint32_t height;
+  uint32_t frame_count;
+  uint32_t section_count;
+  uint64_t section_table_offset;
+  uint64_t file_size;
+  uint64_t content_revision;
+  uint64_t reserved;
+};
+static_assert(sizeof(Vbs3Header) == 64, "Vbs3Header must be 64 bytes");
+
+struct Vbs3SectionEntry {
+  char     type[4];
+  uint32_t flags;
+  uint64_t offset;
+  uint64_t size;
+  uint32_t entry_size;
+  uint32_t entry_count;
+  uint64_t checksum;
+  uint64_t reserved;
+};
+static_assert(sizeof(Vbs3SectionEntry) == 48, "Vbs3SectionEntry must be 48 bytes");
+
+struct Vbs3FrameSummary {
+  int32_t  poc;
+  uint32_t coded_order;
+  uint32_t vcl_nalu_index;
+  uint32_t flags;
+  uint8_t  temporal_id;
+  uint8_t  slice_type;
+  uint8_t  nal_unit_type;
+  uint8_t  avg_qp;
+  uint8_t  num_ref_l0;
+  uint8_t  num_ref_l1;
+  uint8_t  qp_min;
+  uint8_t  qp_max;
+  int32_t  ref_pocs_l0[15];
+  int32_t  ref_pocs_l1[15];
+  uint32_t num_cus;
+  uint32_t cu_index_entry;
+  uint32_t reserved[2];
+};
+static_assert(sizeof(Vbs3FrameSummary) == 160, "Vbs3FrameSummary must be 160 bytes");
+
+struct Vbs3CuIndexEntry {
+  uint64_t offset;         // relative to CUBL payload
+  uint64_t byte_size;
+  uint32_t cu_count;
+  uint32_t flags;
+};
+static_assert(sizeof(Vbs3CuIndexEntry) == 24, "Vbs3CuIndexEntry must be 24 bytes");
 #pragma pack(pop)
 
 struct BinaryStatsState {
   FILE*   file = nullptr;
+  BinaryStatsFormat format = BinaryStatsFormat::Vbs2;
   int     currentPoc = -1;
-  long    frameHeaderPos = 0;
+  uint64_t frameHeaderPos = 0;
+  uint64_t framePayloadStart = 0;
+  uint64_t cublPayloadOffset = 0;
   uint32_t frameCuCount = 0;
   uint32_t qpSum = 0;
+  uint8_t  qpMin = 0;
+  uint8_t  qpMax = 0;
   uint32_t numFrames = 0;
-  uint16_t seqWidth = 0;
-  uint16_t seqHeight = 0;
+  uint32_t seqWidth = 0;
+  uint32_t seqHeight = 0;
   std::vector<Vbs2IndexEntry> index;
+  std::vector<Vbs3FrameSummary> frameSummaries;
+  std::vector<Vbs3CuIndexEntry> cuIndex;
+  Vbs3FrameSummary currentSummary = {};
 
   bool open() {
     if (file) return true;
     const char* path = binaryStatsPath();
     if (!path) return false;
+    format = binaryStatsFormat();
     file = fopen(path, "w+b");
     if (!file) { fprintf(stderr, "VTM_BINARY_STATS: cannot open %s\n", path); return false; }
-    // write placeholder header (filled at finalize)
-    Vbs2Header hdr = {};
-    hdr.magic[0]='V'; hdr.magic[1]='B'; hdr.magic[2]='S'; hdr.magic[3]='2';
-    hdr.width = 0; hdr.height = 0;
-    hdr.num_frames = 0; hdr.index_offset = 0;
-    fwrite(&hdr, sizeof(hdr), 1, file);
+    if (format == BinaryStatsFormat::Vbs3)
+    {
+      Vbs3Header hdr = {};
+      hdr.magic[0]='V'; hdr.magic[1]='B'; hdr.magic[2]='S'; hdr.magic[3]='3';
+      hdr.version_major = 3;
+      hdr.version_minor = 0;
+      hdr.header_size = sizeof(Vbs3Header);
+      hdr.section_entry_size = sizeof(Vbs3SectionEntry);
+      fwrite(&hdr, sizeof(hdr), 1, file);
+      cublPayloadOffset = sizeof(Vbs3Header);
+    }
+    else
+    {
+      Vbs2Header hdr = {};
+      hdr.magic[0]='V'; hdr.magic[1]='B'; hdr.magic[2]='S'; hdr.magic[3]='2';
+      hdr.width = 0; hdr.height = 0;
+      hdr.num_frames = 0; hdr.index_offset = 0;
+      fwrite(&hdr, sizeof(hdr), 1, file);
+    }
     return true;
   }
 
-  void setDimensions(uint16_t w, uint16_t h) {
+  void setDimensions(uint32_t w, uint32_t h) {
     seqWidth = w; seqHeight = h;
+  }
+
+  static Vbs3SectionEntry sectionEntry(const char type[4],
+                                       uint64_t offset,
+                                       uint64_t size,
+                                       uint32_t entrySize,
+                                       uint32_t entryCount)
+  {
+    Vbs3SectionEntry entry = {};
+    entry.type[0] = type[0];
+    entry.type[1] = type[1];
+    entry.type[2] = type[2];
+    entry.type[3] = type[3];
+    entry.offset = offset;
+    entry.size = size;
+    entry.entry_size = entrySize;
+    entry.entry_count = entryCount;
+    return entry;
   }
 
   void beginFrame(int poc, const Slice* slice) {
@@ -183,6 +339,8 @@ struct BinaryStatsState {
     currentPoc = poc;
     frameCuCount = 0;
     qpSum = 0;
+    qpMin = 255;
+    qpMax = 0;
 
     // Build extended frame header
     Vbs2FrameHeader fh = {};
@@ -209,23 +367,71 @@ struct BinaryStatsState {
       }
     }
 
-    frameHeaderPos = ftell(file);
-    fwrite(&fh, sizeof(fh), 1, file);
+    frameHeaderPos = static_cast<uint64_t>(binaryTell(file));
+    if (format == BinaryStatsFormat::Vbs3)
+    {
+      framePayloadStart = frameHeaderPos;
+      currentSummary = {};
+      currentSummary.poc = fh.poc;
+      currentSummary.coded_order = numFrames;
+      currentSummary.vcl_nalu_index = 0xFFFFFFFFu;
+      currentSummary.temporal_id = fh.temporal_id;
+      currentSummary.slice_type = fh.slice_type;
+      currentSummary.nal_unit_type = fh.nal_unit_type;
+      currentSummary.num_ref_l0 = fh.num_ref_l0;
+      currentSummary.num_ref_l1 = fh.num_ref_l1;
+      for (int i = 0; i < 15; i++)
+      {
+        currentSummary.ref_pocs_l0[i] = fh.ref_pocs_l0[i];
+        currentSummary.ref_pocs_l1[i] = fh.ref_pocs_l1[i];
+      }
+      currentSummary.cu_index_entry = numFrames;
+    }
+    else
+    {
+      fwrite(&fh, sizeof(fh), 1, file);
+    }
+  }
+
+  void recordCu(uint8_t qp) {
+    frameCuCount++;
+    qpSum += qp;
+    qpMin = std::min(qpMin, qp);
+    qpMax = std::max(qpMax, qp);
   }
 
   void endFrame() {
     if (!file || currentPoc < 0) return;
-    // read back frame header, patch num_cus and avg_qp
-    long saved = ftell(file);
-    fseek(file, frameHeaderPos, SEEK_SET);
-    Vbs2FrameHeader fh;
-    fread(&fh, sizeof(fh), 1, file);
-    fh.num_cus = (int32_t)frameCuCount;
-    fh.avg_qp = frameCuCount > 0 ? (uint8_t)(qpSum / frameCuCount) : 0;
-    fseek(file, frameHeaderPos, SEEK_SET);
-    fwrite(&fh, sizeof(fh), 1, file);
-    fseek(file, saved, SEEK_SET);
-    index.push_back({ (uint32_t)frameHeaderPos, frameCuCount });
+    const uint8_t avgQp = frameCuCount > 0 ? (uint8_t)(qpSum / frameCuCount) : 0;
+    if (format == BinaryStatsFormat::Vbs3)
+    {
+      const uint64_t frameEnd = static_cast<uint64_t>(binaryTell(file));
+      currentSummary.avg_qp = avgQp;
+      currentSummary.qp_min = frameCuCount > 0 ? qpMin : 0;
+      currentSummary.qp_max = frameCuCount > 0 ? qpMax : 0;
+      currentSummary.num_cus = frameCuCount;
+      frameSummaries.push_back(currentSummary);
+      cuIndex.push_back({
+        framePayloadStart - cublPayloadOffset,
+        frameEnd - framePayloadStart,
+        frameCuCount,
+        0,
+      });
+    }
+    else
+    {
+      // read back frame header, patch num_cus and avg_qp
+      const uint64_t saved = static_cast<uint64_t>(binaryTell(file));
+      binarySeek(file, frameHeaderPos);
+      Vbs2FrameHeader fh;
+      fread(&fh, sizeof(fh), 1, file);
+      fh.num_cus = (int32_t)frameCuCount;
+      fh.avg_qp = avgQp;
+      binarySeek(file, frameHeaderPos);
+      fwrite(&fh, sizeof(fh), 1, file);
+      binarySeek(file, saved);
+      index.push_back({ (uint32_t)frameHeaderPos, frameCuCount });
+    }
     numFrames++;
     currentPoc = -1;
   }
@@ -233,16 +439,53 @@ struct BinaryStatsState {
   void finalize() {
     if (!file) return;
     endFrame();
-    // write frame index
-    uint32_t idxOff = (uint32_t)ftell(file);
-    for (const auto& e : index) fwrite(&e, sizeof(e), 1, file);
-    // patch file header
-    fseek(file, 0, SEEK_SET);
-    Vbs2Header hdr = {};
-    hdr.magic[0]='V'; hdr.magic[1]='B'; hdr.magic[2]='S'; hdr.magic[3]='2';
-    hdr.width = seqWidth; hdr.height = seqHeight;
-    hdr.num_frames = numFrames; hdr.index_offset = idxOff;
-    fwrite(&hdr, sizeof(hdr), 1, file);
+    if (format == BinaryStatsFormat::Vbs3)
+    {
+      const uint64_t cublSize = static_cast<uint64_t>(binaryTell(file)) - cublPayloadOffset;
+
+      const uint64_t fsumOffset = static_cast<uint64_t>(binaryTell(file));
+      for (const auto& summary : frameSummaries) fwrite(&summary, sizeof(summary), 1, file);
+
+      const uint64_t cuidOffset = static_cast<uint64_t>(binaryTell(file));
+      for (const auto& entry : cuIndex) fwrite(&entry, sizeof(entry), 1, file);
+
+      const uint64_t sectionTableOffset = static_cast<uint64_t>(binaryTell(file));
+      std::vector<Vbs3SectionEntry> sections;
+      sections.push_back(sectionEntry("FSUM", fsumOffset, frameSummaries.size() * sizeof(Vbs3FrameSummary), sizeof(Vbs3FrameSummary), static_cast<uint32_t>(frameSummaries.size())));
+      sections.push_back(sectionEntry("CUID", cuidOffset, cuIndex.size() * sizeof(Vbs3CuIndexEntry), sizeof(Vbs3CuIndexEntry), static_cast<uint32_t>(cuIndex.size())));
+      sections.push_back(sectionEntry("CUBL", cublPayloadOffset, cublSize, 0, numFrames));
+      for (const auto& section : sections) fwrite(&section, sizeof(section), 1, file);
+
+      const uint64_t fileSize = static_cast<uint64_t>(binaryTell(file));
+      binarySeek(file, 0);
+      Vbs3Header hdr = {};
+      hdr.magic[0]='V'; hdr.magic[1]='B'; hdr.magic[2]='S'; hdr.magic[3]='3';
+      hdr.version_major = 3;
+      hdr.version_minor = 0;
+      hdr.header_size = sizeof(Vbs3Header);
+      hdr.section_entry_size = sizeof(Vbs3SectionEntry);
+      hdr.width = seqWidth;
+      hdr.height = seqHeight;
+      hdr.frame_count = numFrames;
+      hdr.section_count = static_cast<uint32_t>(sections.size());
+      hdr.section_table_offset = sectionTableOffset;
+      hdr.file_size = fileSize;
+      fwrite(&hdr, sizeof(hdr), 1, file);
+    }
+    else
+    {
+      // write frame index
+      uint32_t idxOff = (uint32_t)binaryTell(file);
+      for (const auto& e : index) fwrite(&e, sizeof(e), 1, file);
+      // patch file header
+      binarySeek(file, 0);
+      Vbs2Header hdr = {};
+      hdr.magic[0]='V'; hdr.magic[1]='B'; hdr.magic[2]='S'; hdr.magic[3]='2';
+      hdr.width = static_cast<uint16_t>(seqWidth);
+      hdr.height = static_cast<uint16_t>(seqHeight);
+      hdr.num_frames = numFrames; hdr.index_offset = idxOff;
+      fwrite(&hdr, sizeof(hdr), 1, file);
+    }
     fclose(file); file = nullptr;
   }
 
@@ -330,8 +573,7 @@ static void writeAllCodedDataBinary(const CodingStructure& cs, const UnitArea& c
       default:
         break;
       }
-      g_binStats.frameCuCount++;
-      g_binStats.qpSum += cu.qp;
+      g_binStats.recordCu((uint8_t)cu.qp);
     }
   }
 }
@@ -796,10 +1038,10 @@ void writeBlockStatisticsHeader(const SPS *sps)
   {
     g_binStats.open();
     g_binStats.setDimensions(
-      (uint16_t)sps->getMaxPicWidthInLumaSamples(),
-      (uint16_t)sps->getMaxPicHeightInLumaSamples());
+      (uint32_t)sps->getMaxPicWidthInLumaSamples(),
+      (uint32_t)sps->getMaxPicHeightInLumaSamples());
     // Suppress text header for binary mode by writing a brief note to dtrace
-    DTRACE_HEADER( g_trace_ctx, "# VoidPlayer Binary Stats (.vbs2) — see %s\n", binaryStatsPath());
+    DTRACE_HEADER( g_trace_ctx, "# VoidPlayer Binary Stats (%s) — see %s\n", binaryStatsFormatName(), binaryStatsPath());
   }
   else if (isCompactStatsMode())
   {
