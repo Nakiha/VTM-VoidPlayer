@@ -49,6 +49,32 @@ set( INC_FILES ${BASE_INC_FILES} ${X86_INC_FILES} ${MD5_INC_FILES} )
 # library
 add_library( ${LIB_NAME} STATIC ${SRC_FILES} ${INC_FILES} ${NATVIS_FILES} )
 
+if( NOT DEFINED VOIDPLAYER_ZSTD_DIR )
+  get_filename_component( VOIDPLAYER_ZSTD_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../../zstd" ABSOLUTE )
+endif()
+
+if( DEFINED VOIDPLAYER_ZSTD_DIR AND EXISTS "${VOIDPLAYER_ZSTD_DIR}/build/cmake/CMakeLists.txt" )
+  if( NOT TARGET libzstd_static )
+    set( ZSTD_BUILD_SHARED OFF CACHE BOOL "" FORCE )
+    set( ZSTD_BUILD_STATIC ON CACHE BOOL "" FORCE )
+    set( ZSTD_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE )
+    set( ZSTD_BUILD_TESTS OFF CACHE BOOL "" FORCE )
+    set( ZSTD_BUILD_CONTRIB OFF CACHE BOOL "" FORCE )
+    set( ZSTD_LEGACY_SUPPORT OFF CACHE BOOL "" FORCE )
+    set( ZSTD_MULTITHREAD_SUPPORT OFF CACHE BOOL "" FORCE )
+    set( ZSTD_USE_STATIC_RUNTIME ON CACHE BOOL "" FORCE )
+    add_subdirectory( "${VOIDPLAYER_ZSTD_DIR}/build/cmake"
+                      "${CMAKE_BINARY_DIR}/_deps/zstd-build"
+                      EXCLUDE_FROM_ALL )
+  endif()
+
+  target_compile_definitions( ${LIB_NAME} PRIVATE VOIDPLAYER_VBS4_ZSTD=1 )
+  target_include_directories( ${LIB_NAME} PRIVATE "${VOIDPLAYER_ZSTD_DIR}/lib" )
+  target_link_libraries( ${LIB_NAME} PRIVATE libzstd_static )
+else()
+  message( FATAL_ERROR "VoidPlayer VBS4 requires vendored zstd. Pass -DVOIDPLAYER_ZSTD_DIR=<repo>/native/analysis/vendor/zstd" )
+endif()
+
 if( EXTENSION_360_VIDEO )
   target_compile_definitions( ${LIB_NAME} PUBLIC EXTENSION_360_VIDEO=1 )
 endif()

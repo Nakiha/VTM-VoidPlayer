@@ -48,16 +48,21 @@
 #include <cstdlib>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
+
+#if defined(VOIDPLAYER_VBS4_ZSTD)
+#include "zstd.h"
+#endif
 
 // ---------------------------------------------------------------------------
 // Stats output mode selection via environment variables:
-//   VTM_BINARY_STATS=<filepath>          → binary VBS output
-//   VTM_BINARY_STATS_FORMAT=VBS2|VBS3    → binary VBS version, defaults to VBS2
-//   VTM_COMPACT_STATS=1          → text compact (one line per CU)
-//   (neither)                    → original verbose VTM format
+//   VTM_BINARY_STATS=<filepath>  -> binary VBS4 output
+//   VTM_COMPACT_STATS=1          -> text compact (one line per CU)
+//   (neither)                    -> original verbose VTM format
 // ---------------------------------------------------------------------------
 
 static bool isCompactStatsMode()
@@ -88,6 +93,7 @@ enum class BinaryStatsFormat
 {
   Vbs2,
   Vbs3,
+  Vbs4,
 };
 
 static BinaryStatsFormat binaryStatsFormat()
@@ -96,25 +102,32 @@ static BinaryStatsFormat binaryStatsFormat()
     const char* env = std::getenv("VTM_BINARY_STATS_FORMAT");
     if (!env || env[0] == '\0')
     {
-      return BinaryStatsFormat::Vbs2;
+      return BinaryStatsFormat::Vbs4;
     }
     const std::string value(env);
+    if (value == "VBS4" || value == "vbs4" || value == "4")
+    {
+      return BinaryStatsFormat::Vbs4;
+    }
     if (value == "VBS3" || value == "vbs3" || value == "3")
     {
-      return BinaryStatsFormat::Vbs3;
+      fprintf(stderr, "VTM_BINARY_STATS_FORMAT: VBS3 is retired, writing VBS4\n");
+      return BinaryStatsFormat::Vbs4;
     }
-    if (value != "VBS2" && value != "vbs2" && value != "2")
+    if (value == "VBS2" || value == "vbs2" || value == "2")
     {
-      fprintf(stderr, "VTM_BINARY_STATS_FORMAT: unsupported value '%s', using VBS2\n", env);
+      fprintf(stderr, "VTM_BINARY_STATS_FORMAT: VBS2 is retired, writing VBS4\n");
+      return BinaryStatsFormat::Vbs4;
     }
-    return BinaryStatsFormat::Vbs2;
+    fprintf(stderr, "VTM_BINARY_STATS_FORMAT: unsupported value '%s', writing VBS4\n", env);
+    return BinaryStatsFormat::Vbs4;
   }();
   return s_format;
 }
 
 static const char* binaryStatsFormatName()
 {
-  return binaryStatsFormat() == BinaryStatsFormat::Vbs3 ? "VBS3" : "VBS2";
+  return "VBS4";
 }
 
 static int64_t binaryTell(FILE* file)
@@ -260,15 +273,257 @@ struct Vbs3CuIndexEntry {
   uint32_t flags;
 };
 static_assert(sizeof(Vbs3CuIndexEntry) == 24, "Vbs3CuIndexEntry must be 24 bytes");
+
+struct Vbs4Header {
+  char     magic[4];       // "VBS4"
+  uint16_t version_major;
+  uint16_t version_minor;
+  uint16_t header_size;
+  uint16_t section_entry_size;
+  uint16_t codec;
+  uint16_t profile;
+  uint32_t flags;
+  uint32_t width;
+  uint32_t height;
+  uint32_t frame_count;
+  uint32_t block_count;
+  uint32_t section_count;
+  uint32_t reserved0;
+  uint64_t section_table_offset;
+  uint64_t file_size;
+  uint64_t content_revision;
+  uint64_t reserved1;
+  uint32_t reserved2;
+};
+static_assert(sizeof(Vbs4Header) == 80, "Vbs4Header must be 80 bytes");
+
+struct Vbs4SectionEntry {
+  char     type[4];
+  uint32_t flags;
+  uint64_t offset;
+  uint64_t size;
+  uint32_t entry_size;
+  uint32_t entry_count;
+  uint64_t checksum;
+  uint64_t reserved0;
+  uint64_t reserved1;
+};
+static_assert(sizeof(Vbs4SectionEntry) == 56, "Vbs4SectionEntry must be 56 bytes");
+
+using Vbs4FrameSummary = Vbs3FrameSummary;
+static_assert(sizeof(Vbs4FrameSummary) == 160, "Vbs4FrameSummary must be 160 bytes");
+
+struct Vbs4FrameIndexEntry {
+  uint32_t block_index;
+  uint32_t local_frame;
+  uint32_t first_record;
+  uint32_t record_count;
+  uint32_t flags;
+  uint32_t reserved;
+};
+static_assert(sizeof(Vbs4FrameIndexEntry) == 24, "Vbs4FrameIndexEntry must be 24 bytes");
+
+struct Vbs4BlockIndexEntry {
+  uint32_t first_frame;
+  uint32_t frame_count;
+  uint32_t first_record;
+  uint32_t record_count;
+  uint64_t payload_offset;
+  uint64_t payload_size;
+  uint64_t decoded_size;
+  uint16_t codec_profile;
+  uint16_t compression;
+  uint32_t flags;
+  uint64_t checksum;
+  uint64_t reserved;
+};
+static_assert(sizeof(Vbs4BlockIndexEntry) == 64, "Vbs4BlockIndexEntry must be 64 bytes");
+
+struct Vbs4DecodedBlockHeader {
+  char     magic[4];       // "BLK4"
+  uint16_t header_size;
+  uint16_t stream_entry_size;
+  uint16_t codec_profile;
+  uint16_t stream_count;
+  uint32_t frame_count;
+  uint32_t record_count;
+  uint32_t flags;
+  uint64_t reserved;
+};
+static_assert(sizeof(Vbs4DecodedBlockHeader) == 32, "Vbs4DecodedBlockHeader must be 32 bytes");
+
+struct Vbs4StreamEntry {
+  uint16_t stream_id;
+  uint16_t encoding;
+  uint32_t offset;
+  uint32_t size;
+  uint32_t value_count;
+  uint32_t flags;
+};
+static_assert(sizeof(Vbs4StreamEntry) == 20, "Vbs4StreamEntry must be 20 bytes");
 #pragma pack(pop)
+
+static constexpr uint16_t VBS4_CODEC_VVC = 3;
+static constexpr uint16_t VBS4_PROFILE_VVCCU1 = 1;
+static constexpr uint16_t VBS4_COMPRESSION_NONE = 0;
+static constexpr uint16_t VBS4_COMPRESSION_ZSTD = 1;
+static constexpr uint16_t VBS4_ENC_RAW = 0;
+static constexpr uint16_t VBS4_ENC_BITSET = 1;
+static constexpr uint16_t VBS4_ENC_ULEB128 = 2;
+static constexpr uint16_t VBS4_ENC_SLEB128_ZIGZAG = 3;
+static constexpr uint16_t VBS4_ENC_FRAME_PREFIX_U32 = 7;
+
+static constexpr uint16_t VBS4_STREAM_FRAME_PREFIX = 1;
+static constexpr uint16_t VBS4_HEVC_X = 2;
+static constexpr uint16_t VBS4_HEVC_Y = 3;
+static constexpr uint16_t VBS4_HEVC_LOG2_W = 4;
+static constexpr uint16_t VBS4_HEVC_LOG2_H = 5;
+static constexpr uint16_t VBS4_HEVC_DEPTH = 6;
+static constexpr uint16_t VBS4_HEVC_PRED_MODE = 7;
+static constexpr uint16_t VBS4_HEVC_QP_DELTA = 8;
+static constexpr uint16_t VBS4_HEVC_INTRA_MODE = 9;
+static constexpr uint16_t VBS4_HEVC_MIP_FLAG = 10;
+static constexpr uint16_t VBS4_HEVC_ISP_MODE = 11;
+static constexpr uint16_t VBS4_HEVC_SKIP_FLAG = 12;
+static constexpr uint16_t VBS4_HEVC_MERGE_FLAG = 13;
+static constexpr uint16_t VBS4_HEVC_INTER_DIR = 14;
+static constexpr uint16_t VBS4_HEVC_MV_L0_X = 15;
+static constexpr uint16_t VBS4_HEVC_MV_L0_Y = 16;
+static constexpr uint16_t VBS4_HEVC_MV_L1_X = 17;
+static constexpr uint16_t VBS4_HEVC_MV_L1_Y = 18;
+static constexpr uint16_t VBS4_HEVC_REF_L0 = 19;
+static constexpr uint16_t VBS4_HEVC_REF_L1 = 20;
+
+struct Vbs4CuRecord {
+  uint16_t x = 0;
+  uint16_t y = 0;
+  uint8_t  w = 0;
+  uint8_t  h = 0;
+  uint8_t  depth = 0;
+  uint8_t  qp = 0;
+  uint8_t  pred_mode = 0;
+  uint8_t  intra_mode = 0;
+  uint8_t  mip_flag = 0;
+  uint8_t  isp_mode = 0;
+  uint8_t  skip = 0;
+  uint8_t  merge_flag = 0;
+  uint8_t  inter_dir = 0;
+  int16_t  mv_l0_x = 0;
+  int16_t  mv_l0_y = 0;
+  int16_t  mv_l1_x = 0;
+  int16_t  mv_l1_y = 0;
+  int8_t   ref_l0 = -1;
+  int8_t   ref_l1 = -1;
+};
+
+struct Vbs4FrameData {
+  Vbs4FrameSummary summary = {};
+  std::vector<Vbs4CuRecord> records;
+};
+
+struct Vbs4StreamData {
+  uint16_t id = 0;
+  uint16_t encoding = 0;
+  uint32_t valueCount = 0;
+  std::vector<uint8_t> bytes;
+};
+
+static void vbs4SetFourcc(char dst[4], const char src[4])
+{
+  dst[0] = src[0];
+  dst[1] = src[1];
+  dst[2] = src[2];
+  dst[3] = src[3];
+}
+
+static void vbs4AppendBytes(std::vector<uint8_t>& out, const void* data, size_t size)
+{
+  const uint8_t* bytes = static_cast<const uint8_t*>(data);
+  out.insert(out.end(), bytes, bytes + size);
+}
+
+static void vbs4AppendU8(std::vector<uint8_t>& out, uint8_t value)
+{
+  out.push_back(value);
+}
+
+static void vbs4AppendU32(std::vector<uint8_t>& out, uint32_t value)
+{
+  out.push_back(static_cast<uint8_t>(value & 0xff));
+  out.push_back(static_cast<uint8_t>((value >> 8) & 0xff));
+  out.push_back(static_cast<uint8_t>((value >> 16) & 0xff));
+  out.push_back(static_cast<uint8_t>((value >> 24) & 0xff));
+}
+
+static void vbs4AppendUleb(std::vector<uint8_t>& out, uint32_t value)
+{
+  do
+  {
+    uint8_t byte = static_cast<uint8_t>(value & 0x7f);
+    value >>= 7;
+    if (value)
+    {
+      byte |= 0x80;
+    }
+    out.push_back(byte);
+  } while (value);
+}
+
+static void vbs4AppendSlebZigzag(std::vector<uint8_t>& out, int32_t value)
+{
+  const uint32_t zigzag = (static_cast<uint32_t>(value) << 1) ^ static_cast<uint32_t>(value >> 31);
+  vbs4AppendUleb(out, zigzag);
+}
+
+static void vbs4AppendBit(std::vector<uint8_t>& out, uint32_t index, bool value)
+{
+  const size_t byteIndex = index >> 3;
+  if (byteIndex >= out.size())
+  {
+    out.resize(byteIndex + 1, 0);
+  }
+  if (value)
+  {
+    out[byteIndex] |= static_cast<uint8_t>(1u << (index & 7));
+  }
+}
+
+static uint8_t vbs4Log2Size(uint8_t value)
+{
+  uint8_t result = 0;
+  while (value > 1)
+  {
+    value >>= 1;
+    result++;
+  }
+  return result;
+}
+
+static Vbs4SectionEntry vbs4SectionEntry(const char type[4],
+                                         uint64_t offset,
+                                         uint64_t size,
+                                         uint32_t entrySize,
+                                         uint32_t entryCount)
+{
+  Vbs4SectionEntry entry = {};
+  vbs4SetFourcc(entry.type, type);
+  entry.offset = offset;
+  entry.size = size;
+  entry.entry_size = entrySize;
+  entry.entry_count = entryCount;
+  return entry;
+}
+
+static bool vbs4NoCompressionRequested()
+{
+  const char* env = std::getenv("VTM_BINARY_STATS_NO_COMPRESSION");
+  return env && env[0] != '\0' && std::string(env) != "0";
+}
 
 struct BinaryStatsState {
   FILE*   file = nullptr;
-  BinaryStatsFormat format = BinaryStatsFormat::Vbs2;
+  BinaryStatsFormat format = BinaryStatsFormat::Vbs4;
   int     currentPoc = -1;
-  uint64_t frameHeaderPos = 0;
-  uint64_t framePayloadStart = 0;
-  uint64_t cublPayloadOffset = 0;
   uint32_t frameCuCount = 0;
   uint32_t qpSum = 0;
   uint8_t  qpMin = 0;
@@ -276,10 +531,9 @@ struct BinaryStatsState {
   uint32_t numFrames = 0;
   uint32_t seqWidth = 0;
   uint32_t seqHeight = 0;
-  std::vector<Vbs2IndexEntry> index;
-  std::vector<Vbs3FrameSummary> frameSummaries;
-  std::vector<Vbs3CuIndexEntry> cuIndex;
-  Vbs3FrameSummary currentSummary = {};
+  Vbs4FrameSummary currentSummary = {};
+  std::vector<Vbs4CuRecord> currentRecords;
+  std::vector<Vbs4FrameData> vbs4Frames;
 
   bool open() {
     if (file) return true;
@@ -288,48 +542,20 @@ struct BinaryStatsState {
     format = binaryStatsFormat();
     file = fopen(path, "w+b");
     if (!file) { fprintf(stderr, "VTM_BINARY_STATS: cannot open %s\n", path); return false; }
-    if (format == BinaryStatsFormat::Vbs3)
-    {
-      Vbs3Header hdr = {};
-      hdr.magic[0]='V'; hdr.magic[1]='B'; hdr.magic[2]='S'; hdr.magic[3]='3';
-      hdr.version_major = 3;
-      hdr.version_minor = 0;
-      hdr.header_size = sizeof(Vbs3Header);
-      hdr.section_entry_size = sizeof(Vbs3SectionEntry);
-      fwrite(&hdr, sizeof(hdr), 1, file);
-      cublPayloadOffset = sizeof(Vbs3Header);
-    }
-    else
-    {
-      Vbs2Header hdr = {};
-      hdr.magic[0]='V'; hdr.magic[1]='B'; hdr.magic[2]='S'; hdr.magic[3]='2';
-      hdr.width = 0; hdr.height = 0;
-      hdr.num_frames = 0; hdr.index_offset = 0;
-      fwrite(&hdr, sizeof(hdr), 1, file);
-    }
+
+    Vbs4Header hdr = {};
+    vbs4SetFourcc(hdr.magic, "VBS4");
+    hdr.version_major = 4;
+    hdr.header_size = sizeof(Vbs4Header);
+    hdr.section_entry_size = sizeof(Vbs4SectionEntry);
+    hdr.codec = VBS4_CODEC_VVC;
+    hdr.profile = VBS4_PROFILE_VVCCU1;
+    fwrite(&hdr, sizeof(hdr), 1, file);
     return true;
   }
 
   void setDimensions(uint32_t w, uint32_t h) {
     seqWidth = w; seqHeight = h;
-  }
-
-  static Vbs3SectionEntry sectionEntry(const char type[4],
-                                       uint64_t offset,
-                                       uint64_t size,
-                                       uint32_t entrySize,
-                                       uint32_t entryCount)
-  {
-    Vbs3SectionEntry entry = {};
-    entry.type[0] = type[0];
-    entry.type[1] = type[1];
-    entry.type[2] = type[2];
-    entry.type[3] = type[3];
-    entry.offset = offset;
-    entry.size = size;
-    entry.entry_size = entrySize;
-    entry.entry_count = entryCount;
-    return entry;
   }
 
   void beginFrame(int poc, const Slice* slice) {
@@ -341,55 +567,31 @@ struct BinaryStatsState {
     qpSum = 0;
     qpMin = 255;
     qpMax = 0;
+    currentRecords.clear();
 
-    // Build extended frame header
-    Vbs2FrameHeader fh = {};
-    fh.poc = poc;
-    fh.num_cus = 0;
-    fh.temporal_id = slice ? slice->getTLayer() : 0;
-    fh.slice_type = slice ? slice->getSliceType() : 0;
-    fh.nal_unit_type = slice ? slice->getNalUnitType() : 0;
-    fh.avg_qp = 0;
+    currentSummary = {};
+    currentSummary.poc = poc;
+    currentSummary.coded_order = numFrames;
+    currentSummary.vcl_nalu_index = 0xFFFFFFFFu;
+    currentSummary.temporal_id = slice ? slice->getTLayer() : 0;
+    currentSummary.slice_type = slice ? slice->getSliceType() : 0;
+    currentSummary.nal_unit_type = slice ? slice->getNalUnitType() : 0;
+    currentSummary.cu_index_entry = numFrames;
 
     if (slice) {
-      int nL0 = slice->getNumRefIdx(REF_PIC_LIST_0);
-      int nL1 = slice->getNumRefIdx(REF_PIC_LIST_1);
-      fh.num_ref_l0 = (uint8_t)std::min(nL0, 15);
-      fh.num_ref_l1 = (uint8_t)std::min(nL1, 15);
+      const int nL0 = slice->getNumRefIdx(REF_PIC_LIST_0);
+      const int nL1 = slice->getNumRefIdx(REF_PIC_LIST_1);
+      currentSummary.num_ref_l0 = static_cast<uint8_t>(std::min(nL0, 15));
+      currentSummary.num_ref_l1 = static_cast<uint8_t>(std::min(nL1, 15));
       for (int i = 0; i < 15; i++) {
-        fh.ref_pocs_l0[i] = (i < nL0) ? slice->getRefPOC(REF_PIC_LIST_0, i) : -1;
-        fh.ref_pocs_l1[i] = (i < nL1) ? slice->getRefPOC(REF_PIC_LIST_1, i) : -1;
+        currentSummary.ref_pocs_l0[i] = (i < nL0) ? slice->getRefPOC(REF_PIC_LIST_0, i) : -1;
+        currentSummary.ref_pocs_l1[i] = (i < nL1) ? slice->getRefPOC(REF_PIC_LIST_1, i) : -1;
       }
     } else {
       for (int i = 0; i < 15; i++) {
-        fh.ref_pocs_l0[i] = -1;
-        fh.ref_pocs_l1[i] = -1;
+        currentSummary.ref_pocs_l0[i] = -1;
+        currentSummary.ref_pocs_l1[i] = -1;
       }
-    }
-
-    frameHeaderPos = static_cast<uint64_t>(binaryTell(file));
-    if (format == BinaryStatsFormat::Vbs3)
-    {
-      framePayloadStart = frameHeaderPos;
-      currentSummary = {};
-      currentSummary.poc = fh.poc;
-      currentSummary.coded_order = numFrames;
-      currentSummary.vcl_nalu_index = 0xFFFFFFFFu;
-      currentSummary.temporal_id = fh.temporal_id;
-      currentSummary.slice_type = fh.slice_type;
-      currentSummary.nal_unit_type = fh.nal_unit_type;
-      currentSummary.num_ref_l0 = fh.num_ref_l0;
-      currentSummary.num_ref_l1 = fh.num_ref_l1;
-      for (int i = 0; i < 15; i++)
-      {
-        currentSummary.ref_pocs_l0[i] = fh.ref_pocs_l0[i];
-        currentSummary.ref_pocs_l1[i] = fh.ref_pocs_l1[i];
-      }
-      currentSummary.cu_index_entry = numFrames;
-    }
-    else
-    {
-      fwrite(&fh, sizeof(fh), 1, file);
     }
   }
 
@@ -400,92 +602,292 @@ struct BinaryStatsState {
     qpMax = std::max(qpMax, qp);
   }
 
+  void recordVbs4Cu(const Vbs4CuRecord& record) {
+    currentRecords.push_back(record);
+    recordCu(record.qp);
+  }
+
   void endFrame() {
     if (!file || currentPoc < 0) return;
-    const uint8_t avgQp = frameCuCount > 0 ? (uint8_t)(qpSum / frameCuCount) : 0;
-    if (format == BinaryStatsFormat::Vbs3)
-    {
-      const uint64_t frameEnd = static_cast<uint64_t>(binaryTell(file));
-      currentSummary.avg_qp = avgQp;
-      currentSummary.qp_min = frameCuCount > 0 ? qpMin : 0;
-      currentSummary.qp_max = frameCuCount > 0 ? qpMax : 0;
-      currentSummary.num_cus = frameCuCount;
-      frameSummaries.push_back(currentSummary);
-      cuIndex.push_back({
-        framePayloadStart - cublPayloadOffset,
-        frameEnd - framePayloadStart,
-        frameCuCount,
-        0,
-      });
-    }
-    else
-    {
-      // read back frame header, patch num_cus and avg_qp
-      const uint64_t saved = static_cast<uint64_t>(binaryTell(file));
-      binarySeek(file, frameHeaderPos);
-      Vbs2FrameHeader fh;
-      fread(&fh, sizeof(fh), 1, file);
-      fh.num_cus = (int32_t)frameCuCount;
-      fh.avg_qp = avgQp;
-      binarySeek(file, frameHeaderPos);
-      fwrite(&fh, sizeof(fh), 1, file);
-      binarySeek(file, saved);
-      index.push_back({ (uint32_t)frameHeaderPos, frameCuCount });
-    }
+    currentSummary.avg_qp = frameCuCount > 0 ? static_cast<uint8_t>(qpSum / frameCuCount) : 0;
+    currentSummary.qp_min = frameCuCount > 0 ? qpMin : 0;
+    currentSummary.qp_max = frameCuCount > 0 ? qpMax : 0;
+    currentSummary.num_cus = frameCuCount;
+
+    Vbs4FrameData frame;
+    frame.summary = currentSummary;
+    frame.records.swap(currentRecords);
+    vbs4Frames.push_back(std::move(frame));
+
     numFrames++;
     currentPoc = -1;
+  }
+
+  static void pushStream(std::vector<Vbs4StreamData>& streams,
+                         uint16_t id,
+                         uint16_t encoding,
+                         uint32_t valueCount,
+                         std::vector<uint8_t>& bytes)
+  {
+    Vbs4StreamData stream;
+    stream.id = id;
+    stream.encoding = encoding;
+    stream.valueCount = valueCount;
+    stream.bytes.swap(bytes);
+    streams.push_back(std::move(stream));
+  }
+
+  std::vector<uint8_t> buildDecodedBlock(size_t firstFrame,
+                                         size_t frameCount,
+                                         uint32_t& outRecordCount) const
+  {
+    std::vector<Vbs4StreamData> streams;
+    std::vector<uint8_t> framePrefix;
+    std::vector<uint8_t> x;
+    std::vector<uint8_t> y;
+    std::vector<uint8_t> log2w;
+    std::vector<uint8_t> log2h;
+    std::vector<uint8_t> depth;
+    std::vector<uint8_t> predMode;
+    std::vector<uint8_t> qpDelta;
+    std::vector<uint8_t> intraMode;
+    std::vector<uint8_t> mipFlag;
+    std::vector<uint8_t> ispMode;
+    std::vector<uint8_t> skipFlag;
+    std::vector<uint8_t> mergeFlag;
+    std::vector<uint8_t> interDir;
+    std::vector<uint8_t> mvL0x;
+    std::vector<uint8_t> mvL0y;
+    std::vector<uint8_t> mvL1x;
+    std::vector<uint8_t> mvL1y;
+    std::vector<uint8_t> refL0;
+    std::vector<uint8_t> refL1;
+
+    uint32_t prefix = 0;
+    for (size_t i = 0; i < frameCount; ++i)
+    {
+      vbs4AppendU32(framePrefix, prefix);
+      prefix += static_cast<uint32_t>(vbs4Frames[firstFrame + i].records.size());
+    }
+    vbs4AppendU32(framePrefix, prefix);
+    outRecordCount = prefix;
+
+    int32_t prevQp = 0;
+    uint32_t recordIndex = 0;
+    for (size_t frameIdx = firstFrame; frameIdx < firstFrame + frameCount; ++frameIdx)
+    {
+      for (const Vbs4CuRecord& record : vbs4Frames[frameIdx].records)
+      {
+        vbs4AppendUleb(x, record.x);
+        vbs4AppendUleb(y, record.y);
+        vbs4AppendU8(log2w, vbs4Log2Size(record.w));
+        vbs4AppendU8(log2h, vbs4Log2Size(record.h));
+        vbs4AppendU8(depth, record.depth);
+        vbs4AppendU8(predMode, record.pred_mode);
+        vbs4AppendSlebZigzag(qpDelta, static_cast<int32_t>(record.qp) - prevQp);
+        prevQp = record.qp;
+        vbs4AppendU8(intraMode, record.intra_mode);
+        vbs4AppendBit(mipFlag, recordIndex, record.mip_flag != 0);
+        vbs4AppendU8(ispMode, record.isp_mode);
+        vbs4AppendBit(skipFlag, recordIndex, record.skip != 0);
+        vbs4AppendBit(mergeFlag, recordIndex, record.merge_flag != 0);
+        vbs4AppendU8(interDir, record.inter_dir);
+        vbs4AppendSlebZigzag(mvL0x, record.mv_l0_x);
+        vbs4AppendSlebZigzag(mvL0y, record.mv_l0_y);
+        vbs4AppendSlebZigzag(mvL1x, record.mv_l1_x);
+        vbs4AppendSlebZigzag(mvL1y, record.mv_l1_y);
+        vbs4AppendU8(refL0, static_cast<uint8_t>(record.ref_l0));
+        vbs4AppendU8(refL1, static_cast<uint8_t>(record.ref_l1));
+        recordIndex++;
+      }
+    }
+
+    pushStream(streams, VBS4_STREAM_FRAME_PREFIX, VBS4_ENC_FRAME_PREFIX_U32, static_cast<uint32_t>(frameCount + 1), framePrefix);
+    pushStream(streams, VBS4_HEVC_X, VBS4_ENC_ULEB128, outRecordCount, x);
+    pushStream(streams, VBS4_HEVC_Y, VBS4_ENC_ULEB128, outRecordCount, y);
+    pushStream(streams, VBS4_HEVC_LOG2_W, VBS4_ENC_RAW, outRecordCount, log2w);
+    pushStream(streams, VBS4_HEVC_LOG2_H, VBS4_ENC_RAW, outRecordCount, log2h);
+    pushStream(streams, VBS4_HEVC_DEPTH, VBS4_ENC_RAW, outRecordCount, depth);
+    pushStream(streams, VBS4_HEVC_PRED_MODE, VBS4_ENC_RAW, outRecordCount, predMode);
+    pushStream(streams, VBS4_HEVC_QP_DELTA, VBS4_ENC_SLEB128_ZIGZAG, outRecordCount, qpDelta);
+    pushStream(streams, VBS4_HEVC_INTRA_MODE, VBS4_ENC_RAW, outRecordCount, intraMode);
+    pushStream(streams, VBS4_HEVC_MIP_FLAG, VBS4_ENC_BITSET, outRecordCount, mipFlag);
+    pushStream(streams, VBS4_HEVC_ISP_MODE, VBS4_ENC_RAW, outRecordCount, ispMode);
+    pushStream(streams, VBS4_HEVC_SKIP_FLAG, VBS4_ENC_BITSET, outRecordCount, skipFlag);
+    pushStream(streams, VBS4_HEVC_MERGE_FLAG, VBS4_ENC_BITSET, outRecordCount, mergeFlag);
+    pushStream(streams, VBS4_HEVC_INTER_DIR, VBS4_ENC_RAW, outRecordCount, interDir);
+    pushStream(streams, VBS4_HEVC_MV_L0_X, VBS4_ENC_SLEB128_ZIGZAG, outRecordCount, mvL0x);
+    pushStream(streams, VBS4_HEVC_MV_L0_Y, VBS4_ENC_SLEB128_ZIGZAG, outRecordCount, mvL0y);
+    pushStream(streams, VBS4_HEVC_MV_L1_X, VBS4_ENC_SLEB128_ZIGZAG, outRecordCount, mvL1x);
+    pushStream(streams, VBS4_HEVC_MV_L1_Y, VBS4_ENC_SLEB128_ZIGZAG, outRecordCount, mvL1y);
+    pushStream(streams, VBS4_HEVC_REF_L0, VBS4_ENC_RAW, outRecordCount, refL0);
+    pushStream(streams, VBS4_HEVC_REF_L1, VBS4_ENC_RAW, outRecordCount, refL1);
+
+    Vbs4DecodedBlockHeader header = {};
+    vbs4SetFourcc(header.magic, "BLK4");
+    header.header_size = sizeof(Vbs4DecodedBlockHeader);
+    header.stream_entry_size = sizeof(Vbs4StreamEntry);
+    header.codec_profile = VBS4_PROFILE_VVCCU1;
+    header.stream_count = static_cast<uint16_t>(streams.size());
+    header.frame_count = static_cast<uint32_t>(frameCount);
+    header.record_count = outRecordCount;
+
+    std::vector<uint8_t> out;
+    vbs4AppendBytes(out, &header, sizeof(header));
+    const size_t streamTableOffset = out.size();
+    out.resize(out.size() + streams.size() * sizeof(Vbs4StreamEntry), 0);
+
+    uint32_t payloadOffset = static_cast<uint32_t>(out.size());
+    for (size_t i = 0; i < streams.size(); ++i)
+    {
+      Vbs4StreamEntry entry = {};
+      entry.stream_id = streams[i].id;
+      entry.encoding = streams[i].encoding;
+      entry.offset = payloadOffset;
+      entry.size = static_cast<uint32_t>(streams[i].bytes.size());
+      entry.value_count = streams[i].valueCount;
+      std::memcpy(out.data() + streamTableOffset + i * sizeof(Vbs4StreamEntry), &entry, sizeof(entry));
+      out.insert(out.end(), streams[i].bytes.begin(), streams[i].bytes.end());
+      payloadOffset += entry.size;
+    }
+    return out;
+  }
+
+  void finalizeVbs4() {
+    constexpr uint64_t targetDecodedBytes = 16ull * 1024ull * 1024ull;
+    constexpr uint32_t maxFramesPerBlock = 4096;
+    constexpr uint64_t estimatedBytesPerRecord = 24;
+
+    binarySeek(file, sizeof(Vbs4Header));
+
+    std::vector<Vbs4FrameIndexEntry> frameIndex;
+    std::vector<Vbs4BlockIndexEntry> blockIndex;
+    frameIndex.reserve(vbs4Frames.size());
+
+    uint64_t cpayBytes = 0;
+    uint32_t globalFirstRecord = 0;
+    size_t firstFrame = 0;
+    while (firstFrame < vbs4Frames.size())
+    {
+      size_t frameCount = 0;
+      uint64_t estimate = sizeof(Vbs4DecodedBlockHeader) + 20ull * sizeof(Vbs4StreamEntry);
+      do
+      {
+        estimate += vbs4Frames[firstFrame + frameCount].records.size() * estimatedBytesPerRecord;
+        frameCount++;
+      } while (firstFrame + frameCount < vbs4Frames.size() &&
+               frameCount < maxFramesPerBlock &&
+               estimate < targetDecodedBytes);
+
+      uint32_t recordCount = 0;
+      std::vector<uint8_t> decoded = buildDecodedBlock(firstFrame, frameCount, recordCount);
+      const std::vector<uint8_t>* payload = &decoded;
+      std::vector<uint8_t> compressed;
+      bool compressedUsed = false;
+#if defined(VOIDPLAYER_VBS4_ZSTD)
+      if (!vbs4NoCompressionRequested() && !decoded.empty())
+      {
+        const size_t bound = ZSTD_compressBound(decoded.size());
+        compressed.resize(bound);
+        const size_t compressedSize = ZSTD_compress(compressed.data(), compressed.size(), decoded.data(), decoded.size(), 3);
+        if (!ZSTD_isError(compressedSize) && compressedSize < decoded.size())
+        {
+          compressed.resize(compressedSize);
+          payload = &compressed;
+          compressedUsed = true;
+        }
+      }
+#endif
+
+      const uint32_t blockIdx = static_cast<uint32_t>(blockIndex.size());
+      uint32_t localFirstRecord = 0;
+      for (size_t i = 0; i < frameCount; ++i)
+      {
+        const uint32_t frameRecords = static_cast<uint32_t>(vbs4Frames[firstFrame + i].records.size());
+        Vbs4FrameIndexEntry fidx = {};
+        fidx.block_index = blockIdx;
+        fidx.local_frame = static_cast<uint32_t>(i);
+        fidx.first_record = globalFirstRecord + localFirstRecord;
+        fidx.record_count = frameRecords;
+        frameIndex.push_back(fidx);
+        localFirstRecord += frameRecords;
+      }
+
+      Vbs4BlockIndexEntry bidx = {};
+      bidx.first_frame = static_cast<uint32_t>(firstFrame);
+      bidx.frame_count = static_cast<uint32_t>(frameCount);
+      bidx.first_record = globalFirstRecord;
+      bidx.record_count = recordCount;
+      bidx.payload_offset = cpayBytes;
+      bidx.payload_size = payload->size();
+      bidx.decoded_size = decoded.size();
+      bidx.codec_profile = VBS4_PROFILE_VVCCU1;
+      bidx.compression = compressedUsed ? VBS4_COMPRESSION_ZSTD : VBS4_COMPRESSION_NONE;
+      blockIndex.push_back(bidx);
+
+      if (!payload->empty())
+      {
+        fwrite(payload->data(), 1, payload->size(), file);
+      }
+      cpayBytes += payload->size();
+      globalFirstRecord += recordCount;
+      firstFrame += frameCount;
+    }
+
+    const uint64_t fsumOffset = static_cast<uint64_t>(binaryTell(file));
+    for (const auto& frame : vbs4Frames)
+    {
+      fwrite(&frame.summary, sizeof(frame.summary), 1, file);
+    }
+
+    const uint64_t fidxOffset = static_cast<uint64_t>(binaryTell(file));
+    for (const auto& entry : frameIndex)
+    {
+      fwrite(&entry, sizeof(entry), 1, file);
+    }
+
+    const uint64_t bidxOffset = static_cast<uint64_t>(binaryTell(file));
+    for (const auto& entry : blockIndex)
+    {
+      fwrite(&entry, sizeof(entry), 1, file);
+    }
+
+    const uint64_t sectionTableOffset = static_cast<uint64_t>(binaryTell(file));
+    std::vector<Vbs4SectionEntry> sections;
+    sections.push_back(vbs4SectionEntry("FSUM", fsumOffset, vbs4Frames.size() * sizeof(Vbs4FrameSummary), sizeof(Vbs4FrameSummary), static_cast<uint32_t>(vbs4Frames.size())));
+    sections.push_back(vbs4SectionEntry("FIDX", fidxOffset, frameIndex.size() * sizeof(Vbs4FrameIndexEntry), sizeof(Vbs4FrameIndexEntry), static_cast<uint32_t>(frameIndex.size())));
+    sections.push_back(vbs4SectionEntry("BIDX", bidxOffset, blockIndex.size() * sizeof(Vbs4BlockIndexEntry), sizeof(Vbs4BlockIndexEntry), static_cast<uint32_t>(blockIndex.size())));
+    sections.push_back(vbs4SectionEntry("CPAY", sizeof(Vbs4Header), cpayBytes, 0, static_cast<uint32_t>(blockIndex.size())));
+    for (const auto& section : sections)
+    {
+      fwrite(&section, sizeof(section), 1, file);
+    }
+
+    const uint64_t fileSize = static_cast<uint64_t>(binaryTell(file));
+    binarySeek(file, 0);
+    Vbs4Header hdr = {};
+    vbs4SetFourcc(hdr.magic, "VBS4");
+    hdr.version_major = 4;
+    hdr.version_minor = 0;
+    hdr.header_size = sizeof(Vbs4Header);
+    hdr.section_entry_size = sizeof(Vbs4SectionEntry);
+    hdr.codec = VBS4_CODEC_VVC;
+    hdr.profile = VBS4_PROFILE_VVCCU1;
+    hdr.width = seqWidth;
+    hdr.height = seqHeight;
+    hdr.frame_count = static_cast<uint32_t>(vbs4Frames.size());
+    hdr.block_count = static_cast<uint32_t>(blockIndex.size());
+    hdr.section_count = static_cast<uint32_t>(sections.size());
+    hdr.section_table_offset = sectionTableOffset;
+    hdr.file_size = fileSize;
+    hdr.content_revision = 1;
+    fwrite(&hdr, sizeof(hdr), 1, file);
   }
 
   void finalize() {
     if (!file) return;
     endFrame();
-    if (format == BinaryStatsFormat::Vbs3)
-    {
-      const uint64_t cublSize = static_cast<uint64_t>(binaryTell(file)) - cublPayloadOffset;
-
-      const uint64_t fsumOffset = static_cast<uint64_t>(binaryTell(file));
-      for (const auto& summary : frameSummaries) fwrite(&summary, sizeof(summary), 1, file);
-
-      const uint64_t cuidOffset = static_cast<uint64_t>(binaryTell(file));
-      for (const auto& entry : cuIndex) fwrite(&entry, sizeof(entry), 1, file);
-
-      const uint64_t sectionTableOffset = static_cast<uint64_t>(binaryTell(file));
-      std::vector<Vbs3SectionEntry> sections;
-      sections.push_back(sectionEntry("FSUM", fsumOffset, frameSummaries.size() * sizeof(Vbs3FrameSummary), sizeof(Vbs3FrameSummary), static_cast<uint32_t>(frameSummaries.size())));
-      sections.push_back(sectionEntry("CUID", cuidOffset, cuIndex.size() * sizeof(Vbs3CuIndexEntry), sizeof(Vbs3CuIndexEntry), static_cast<uint32_t>(cuIndex.size())));
-      sections.push_back(sectionEntry("CUBL", cublPayloadOffset, cublSize, 0, numFrames));
-      for (const auto& section : sections) fwrite(&section, sizeof(section), 1, file);
-
-      const uint64_t fileSize = static_cast<uint64_t>(binaryTell(file));
-      binarySeek(file, 0);
-      Vbs3Header hdr = {};
-      hdr.magic[0]='V'; hdr.magic[1]='B'; hdr.magic[2]='S'; hdr.magic[3]='3';
-      hdr.version_major = 3;
-      hdr.version_minor = 0;
-      hdr.header_size = sizeof(Vbs3Header);
-      hdr.section_entry_size = sizeof(Vbs3SectionEntry);
-      hdr.width = seqWidth;
-      hdr.height = seqHeight;
-      hdr.frame_count = numFrames;
-      hdr.section_count = static_cast<uint32_t>(sections.size());
-      hdr.section_table_offset = sectionTableOffset;
-      hdr.file_size = fileSize;
-      fwrite(&hdr, sizeof(hdr), 1, file);
-    }
-    else
-    {
-      // write frame index
-      uint32_t idxOff = (uint32_t)binaryTell(file);
-      for (const auto& e : index) fwrite(&e, sizeof(e), 1, file);
-      // patch file header
-      binarySeek(file, 0);
-      Vbs2Header hdr = {};
-      hdr.magic[0]='V'; hdr.magic[1]='B'; hdr.magic[2]='S'; hdr.magic[3]='2';
-      hdr.width = static_cast<uint16_t>(seqWidth);
-      hdr.height = static_cast<uint16_t>(seqHeight);
-      hdr.num_frames = numFrames; hdr.index_offset = idxOff;
-      fwrite(&hdr, sizeof(hdr), 1, file);
-    }
+    finalizeVbs4();
     fclose(file); file = nullptr;
   }
 
@@ -511,69 +913,64 @@ static void writeAllCodedDataBinary(const CodingStructure& cs, const UnitArea& c
       g_binStats.beginFrame(poc, cs.slice);
       if (!g_binStats.file) return;
 
-      Vbs2CuCommon common;
-      common.x = (uint16_t)cu.lx();
-      common.y = (uint16_t)cu.ly();
-      common.w = (uint8_t)cu.lwidth();
-      common.h = (uint8_t)cu.lheight();
-      common.depth = cu.depth;
-      common.qp = (uint8_t)cu.qp;
-      common.pred_mode = (uint8_t)cu.predMode;
-      fwrite(&common, sizeof(common), 1, g_binStats.file);
+      Vbs4CuRecord record;
+      record.x = (uint16_t)cu.lx();
+      record.y = (uint16_t)cu.ly();
+      record.w = (uint8_t)cu.lwidth();
+      record.h = (uint8_t)cu.lheight();
+      record.depth = cu.depth;
+      record.qp = (uint8_t)cu.qp;
+      record.pred_mode = (uint8_t)cu.predMode;
 
       switch (cu.predMode)
       {
       case MODE_INTRA:
       {
-        Vbs2CuIntra ext = {};
         for (const PredictionUnit &pu : CU::traversePUs(cu))
         {
           if (pu.Y().valid())
           {
-            ext.intra_mode = (uint8_t)PU::getFinalIntraMode(pu, ChannelType::LUMA);
-            ext.mip_flag = cu.mipFlag ? 1 : 0;
-            ext.isp_mode = (uint8_t)to_uint(cu.ispMode);
+            record.intra_mode = (uint8_t)PU::getFinalIntraMode(pu, ChannelType::LUMA);
+            record.mip_flag = cu.mipFlag ? 1 : 0;
+            record.isp_mode = (uint8_t)to_uint(cu.ispMode);
             break;
           }
         }
-        fwrite(&ext, sizeof(ext), 1, g_binStats.file);
         break;
       }
       case MODE_INTER:
       {
-        Vbs2CuInter ext = {};
-        ext.skip = cu.skip ? 1 : 0;
+        record.skip = cu.skip ? 1 : 0;
         for (const PredictionUnit &pu : CU::traversePUs(cu))
         {
-          ext.merge_flag = pu.mergeFlag ? 1 : 0;
-          ext.inter_dir = (uint8_t)pu.interDir;
+          record.merge_flag = pu.mergeFlag ? 1 : 0;
+          record.inter_dir = (uint8_t)pu.interDir;
           if (pu.interDir != 2)
           {
             Mv mv = pu.mv[REF_PIC_LIST_0];
             mv.hor = mv.hor >= 0 ? (mv.hor + nOffset) >> nShift : -((-mv.hor + nOffset) >> nShift);
             mv.ver = mv.ver >= 0 ? (mv.ver + nOffset) >> nShift : -((-mv.ver + nOffset) >> nShift);
-            ext.mv_l0_x = (int16_t)mv.hor;
-            ext.mv_l0_y = (int16_t)mv.ver;
+            record.mv_l0_x = (int16_t)mv.hor;
+            record.mv_l0_y = (int16_t)mv.ver;
           }
           if (pu.interDir != 1)
           {
             Mv mv = pu.mv[REF_PIC_LIST_1];
             mv.hor = mv.hor >= 0 ? (mv.hor + nOffset) >> nShift : -((-mv.hor + nOffset) >> nShift);
             mv.ver = mv.ver >= 0 ? (mv.ver + nOffset) >> nShift : -((-mv.ver + nOffset) >> nShift);
-            ext.mv_l1_x = (int16_t)mv.hor;
-            ext.mv_l1_y = (int16_t)mv.ver;
+            record.mv_l1_x = (int16_t)mv.hor;
+            record.mv_l1_y = (int16_t)mv.ver;
           }
-          ext.ref_l0 = (int8_t)pu.refIdx[REF_PIC_LIST_0];
-          ext.ref_l1 = (int8_t)pu.refIdx[REF_PIC_LIST_1];
+          record.ref_l0 = (int8_t)pu.refIdx[REF_PIC_LIST_0];
+          record.ref_l1 = (int8_t)pu.refIdx[REF_PIC_LIST_1];
           break;
         }
-        fwrite(&ext, sizeof(ext), 1, g_binStats.file);
         break;
       }
       default:
         break;
       }
-      g_binStats.recordCu((uint8_t)cu.qp);
+      g_binStats.recordVbs4Cu(record);
     }
   }
 }
